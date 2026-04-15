@@ -1,8 +1,10 @@
-# pg-branch
+# pg-branch (proof of concept)
 
 Local PostgreSQL database branching. Create isolated database copies, track schema and data changes, merge them back.
 
 Think `git branch` for your local Postgres.
+
+> **Note:** This is a proof of concept and is not actively maintained. Feel free to fork it. — [@Eric162](https://github.com/Eric162)
 
 ## Install
 
