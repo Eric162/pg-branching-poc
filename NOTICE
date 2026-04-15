@@ -1,0 +1,17 @@
+pg-branch
+Copyright 2025 Eric Shirley
+
+This product includes software inspired by and derived from concepts in:
+
+  Xata pgstream / pg-local-branch
+  Copyright 2024 Xata, Inc.
+  Licensed under the Apache License, Version 2.0
+  https://github.com/xataio/pgstream
+
+The original Xata work implements PostgreSQL database branching using
+Kubernetes VolumeSnapshots and the CloudNativePG operator. pg-branch
+reimplements the branching concept as a standalone CLI tool using
+PostgreSQL template databases, DDL event triggers, and three-way merge.
+
+No source code was copied from the original Xata project. The branching
+model, API surface, and implementation are original to pg-branch.
