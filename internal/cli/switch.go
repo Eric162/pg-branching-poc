@@ -29,7 +29,7 @@ var switchCmd = &cobra.Command{
 		}
 
 		if _, exists := state.GetBranch(name); !exists {
-			return fmt.Errorf("branch %q not found", name)
+			return fmt.Errorf("branch %q not found. Run 'pg-branch list' to see available branches", name)
 		}
 
 		state.CurrentBranch = name

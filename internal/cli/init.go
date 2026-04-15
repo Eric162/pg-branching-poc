@@ -28,7 +28,16 @@ var initCmd = &cobra.Command{
 			return err
 		}
 
-		// Install tracking schema
+		// Check if already initialized
+		has, err := tracker.HasTrackingSchema(ctx, conn)
+		if err != nil {
+			return fmt.Errorf("check tracking schema: %w", err)
+		}
+		if has {
+			fmt.Printf("pg-branch already initialized on %q (re-initializing state file)\n", dbName)
+		}
+
+		// Install tracking schema (idempotent — uses IF NOT EXISTS)
 		if err := tracker.InstallTrackingSchema(ctx, conn); err != nil {
 			return err
 		}

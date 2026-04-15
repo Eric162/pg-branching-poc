@@ -22,9 +22,13 @@ var deleteCmd = &cobra.Command{
 			return fmt.Errorf("load state: %w", err)
 		}
 
+		if name == "main" {
+			return fmt.Errorf("cannot delete main branch")
+		}
+
 		bs, exists := state.GetBranch(name)
 		if !exists {
-			return fmt.Errorf("branch %q not found", name)
+			return fmt.Errorf("branch %q not found. Run 'pg-branch list' to see available branches", name)
 		}
 
 		adminConn, err := connectAdmin(ctx, u)

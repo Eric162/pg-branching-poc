@@ -48,6 +48,24 @@ var createCmd = &cobra.Command{
 		}
 		defer adminConn.Close()
 
+		// Check if target DB already exists
+		exists, err := adminConn.DatabaseExists(ctx, branchDBName)
+		if err != nil {
+			return fmt.Errorf("check database exists: %w", err)
+		}
+		if exists {
+			return fmt.Errorf("database %q already exists. Delete it first or choose a different branch name", branchDBName)
+		}
+
+		// Verify parent DB exists
+		parentExists, err := adminConn.DatabaseExists(ctx, parentDB)
+		if err != nil {
+			return fmt.Errorf("check parent exists: %w", err)
+		}
+		if !parentExists {
+			return fmt.Errorf("parent database %q does not exist", parentDB)
+		}
+
 		fmt.Printf("Creating branch %q from %q...\n", name, parentDB)
 
 		if err := branch.Create(ctx, adminConn, name, parentDB, branchDBName); err != nil {
