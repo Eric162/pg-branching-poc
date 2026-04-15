@@ -3,6 +3,7 @@ package merge
 import (
 	"context"
 	"fmt"
+	"os"
 
 	"github.com/pg-branch/pg-branch/internal/diff"
 	"github.com/pg-branch/pg-branch/internal/pg"
@@ -25,6 +26,7 @@ type Options struct {
 	MainDB      string
 	DryRun      bool
 	Resolve     ResolveMode
+	Progress    diff.ProgressFunc
 }
 
 // Execute performs a three-way merge from branch into main.
@@ -53,6 +55,7 @@ func Execute(ctx context.Context, adminConn *pg.Conn, opts Options) (*MergeResul
 	defer branchConn.Close()
 
 	// 1. Load branch-point snapshot
+	fmt.Fprintf(os.Stderr, "  Loading branch-point snapshot...\n")
 	snapshotData, err := tracker.LoadSnapshot(ctx, mainConn, opts.BranchName)
 	if err != nil {
 		return nil, fmt.Errorf("load branch-point snapshot: %w", err)
@@ -63,16 +66,19 @@ func Execute(ctx context.Context, adminConn *pg.Conn, opts Options) (*MergeResul
 	}
 
 	// 2. Get current schemas
+	fmt.Fprintf(os.Stderr, "  Snapshotting main schema...\n")
 	mainSchema, err := mainConn.TakeSchemaSnapshot(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("snapshot main schema: %w", err)
 	}
+	fmt.Fprintf(os.Stderr, "  Snapshotting branch schema...\n")
 	branchSchema, err := branchConn.TakeSchemaSnapshot(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("snapshot branch schema: %w", err)
 	}
 
 	// 3. Compute changes on each side
+	fmt.Fprintf(os.Stderr, "  Computing schema diff...\n")
 	mainChanges := diff.SchemaDiff(branchPointSchema, mainSchema)
 	branchChanges := diff.SchemaDiff(branchPointSchema, branchSchema)
 
@@ -86,11 +92,13 @@ func Execute(ctx context.Context, adminConn *pg.Conn, opts Options) (*MergeResul
 	buildSchemaMergeOps(result, mainChanges, branchChanges, ddlLog, opts.Resolve)
 
 	// 6. Data merge — compare checksums
-	mainChecksums, err := diff.ComputeTableChecksums(ctx, mainConn)
+	fmt.Fprintf(os.Stderr, "  Checksumming main...\n")
+	mainChecksums, err := diff.ComputeTableChecksums(ctx, mainConn, opts.Progress)
 	if err != nil {
 		return nil, fmt.Errorf("main checksums: %w", err)
 	}
-	branchChecksums, err := diff.ComputeTableChecksums(ctx, branchConn)
+	fmt.Fprintf(os.Stderr, "  Checksumming branch...\n")
+	branchChecksums, err := diff.ComputeTableChecksums(ctx, branchConn, opts.Progress)
 	if err != nil {
 		return nil, fmt.Errorf("branch checksums: %w", err)
 	}

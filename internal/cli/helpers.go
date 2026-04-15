@@ -35,6 +35,17 @@ func connectAdmin(ctx context.Context, pgURL string) (*pg.Conn, error) {
 	return pg.Connect(ctx, adminURL)
 }
 
+// stderrProgress returns a ProgressFunc that prints a carriage-return progress line to stderr.
+func stderrProgress(label string) func(current, total int, detail string) {
+	return func(current, total int, detail string) {
+		fmt.Fprintf(os.Stderr, "\r\033[2K    [%d/%d] %s", current, total, detail)
+		if current == total {
+			// Move to next line so phase labels don't overwrite
+			fmt.Fprintf(os.Stderr, "\n")
+		}
+	}
+}
+
 // mustResolveURL resolves the URL or exits with an error.
 func mustResolveURL() string {
 	u := resolveURL()

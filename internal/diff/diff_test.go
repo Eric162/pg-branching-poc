@@ -166,7 +166,7 @@ func TestComputeTableChecksums(t *testing.T) {
 		t.Fatalf("create table: %v", err)
 	}
 
-	checksums, err := diff.ComputeTableChecksums(ctx, conn)
+	checksums, err := diff.ComputeTableChecksums(ctx, conn, nil)
 	if err != nil {
 		t.Fatalf("compute checksums: %v", err)
 	}

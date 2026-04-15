@@ -74,11 +74,11 @@ var diffCmd = &cobra.Command{
 		fmt.Println(diff.FormatChanges(changes))
 
 		// Data diff via checksums
-		parentChecksums, err := diff.ComputeTableChecksums(ctx, parentConn)
+		parentChecksums, err := diff.ComputeTableChecksums(ctx, parentConn, stderrProgress("Checksumming parent"))
 		if err != nil {
 			return fmt.Errorf("parent checksums: %w", err)
 		}
-		branchChecksums, err := diff.ComputeTableChecksums(ctx, branchConn)
+		branchChecksums, err := diff.ComputeTableChecksums(ctx, branchConn, stderrProgress("Checksumming branch"))
 		if err != nil {
 			return fmt.Errorf("branch checksums: %w", err)
 		}

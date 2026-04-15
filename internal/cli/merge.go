@@ -64,6 +64,7 @@ var mergeCmd = &cobra.Command{
 			MainDB:     targetDB,
 			DryRun:     !mergeApply,
 			Resolve:    resolveMode,
+			Progress:   stderrProgress("Checksumming"),
 		}
 
 		result, err := merge.Execute(ctx, adminConn, opts)
