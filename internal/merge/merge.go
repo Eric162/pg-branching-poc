@@ -4,6 +4,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
+	"sort"
+	"strings"
 
 	"github.com/pg-branch/pg-branch/internal/diff"
 	"github.com/pg-branch/pg-branch/internal/pg"
@@ -89,7 +92,7 @@ func Execute(ctx context.Context, adminConn *pg.Conn, opts Options) (*MergeResul
 	}
 
 	// 5. Build schema merge ops
-	buildSchemaMergeOps(result, mainChanges, branchChanges, ddlLog, opts.Resolve)
+	buildSchemaMergeOps(result, mainChanges, branchChanges, ddlLog, opts.Resolve, branchConn)
 
 	// 6. Data merge — compare checksums
 	fmt.Fprintf(os.Stderr, "  Checksumming main...\n")
@@ -122,12 +125,18 @@ func Execute(ctx context.Context, adminConn *pg.Conn, opts Options) (*MergeResul
 }
 
 // buildSchemaMergeOps compares branch and main schema changes to detect conflicts and build ops.
-func buildSchemaMergeOps(result *MergeResult, mainChanges, branchChanges []diff.SchemaChange, ddlLog []tracker.DDLEntry, resolve ResolveMode) {
+func buildSchemaMergeOps(result *MergeResult, mainChanges, branchChanges []diff.SchemaChange, ddlLog []tracker.DDLEntry, resolve ResolveMode, branchConn *pg.Conn) {
 	// Index main changes by object name for conflict detection
 	mainChangeMap := make(map[string]diff.SchemaChange)
 	for _, mc := range mainChanges {
 		mainChangeMap[mc.ObjectName] = mc
 	}
+
+	// Track pg_dump SQL for added tables — indexes/constraints are included in the dump
+	pgDumpSQL := make(map[string]string) // table name -> full pg_dump DDL
+
+	// Sort: process tables before indexes/constraints so pg_dump results are available
+	sortChanges(branchChanges)
 
 	// For each branch change, check if main also changed the same object
 	branchObjectsHandled := make(map[string]bool)
@@ -136,8 +145,22 @@ func buildSchemaMergeOps(result *MergeResult, mainChanges, branchChanges []diff.
 		mc, mainAlsoChanged := mainChangeMap[bc.ObjectName]
 
 		if !mainAlsoChanged {
+			// Skip indexes/constraints already included in a pg_dump for an added table
+			if (bc.ObjectKind == "index" || bc.ObjectKind == "constraint") && bc.Type == diff.Added {
+				if coveredByPgDump(bc.ObjectName, pgDumpSQL) {
+					result.SchemaOps = append(result.SchemaOps, SchemaOp{
+						Description: bc.Detail + " (included in table DDL)",
+						Status:      "skipped",
+					})
+					continue
+				}
+			}
+
 			// Only branch changed this object — safe to apply
-			sql := findDDLForObject(ddlLog, bc.ObjectName)
+			sql := findSQL(bc, ddlLog, branchConn)
+			if bc.ObjectKind == "table" && bc.Type == diff.Added && sql != "" {
+				pgDumpSQL[bc.ObjectName] = sql
+			}
 			result.SchemaOps = append(result.SchemaOps, SchemaOp{
 				Description: bc.Detail,
 				SQL:         sql,
@@ -158,7 +181,7 @@ func buildSchemaMergeOps(result *MergeResult, mainChanges, branchChanges []diff.
 
 		// Real conflict
 		if resolve == ResolveBranch {
-			sql := findDDLForObject(ddlLog, bc.ObjectName)
+			sql := findSQL(bc, ddlLog, branchConn)
 			result.SchemaOps = append(result.SchemaOps, SchemaOp{
 				Description: bc.Detail + " (branch wins)",
 				SQL:         sql,
@@ -184,6 +207,41 @@ func buildSchemaMergeOps(result *MergeResult, mainChanges, branchChanges []diff.
 	}
 }
 
+// findSQL determines the SQL to replay for a branch schema change.
+// For added/removed tables, uses pg_dump to get exact DDL.
+// For other changes, falls back to DDL log lookup.
+func findSQL(change diff.SchemaChange, ddlLog []tracker.DDLEntry, branchConn *pg.Conn) string {
+	if change.ObjectKind == "table" && change.Type == diff.Added {
+		// Use pg_dump for added tables — DDL log may not have the CREATE TABLE
+		sql, err := pgDumpTable(branchConn.URL(), change.ObjectName)
+		if err == nil && sql != "" {
+			return sql
+		}
+	}
+	return findDDLForObject(ddlLog, change.ObjectName)
+}
+
+// pgDumpTable runs pg_dump --schema-only for a single table and returns the DDL.
+func pgDumpTable(dbURL, tableName string) (string, error) {
+	// tableName is "schema.table" — pg_dump wants it as-is
+	cmd := exec.Command("pg_dump", dbURL, "--schema-only", "--no-owner", "--no-acl", "-t", tableName)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("pg_dump: %w", err)
+	}
+	// Filter out comments, SET statements, psql meta-commands, and empty lines — keep only DDL
+	var ddl strings.Builder
+	for _, line := range strings.Split(string(out), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "--") || strings.HasPrefix(trimmed, "SET ") || strings.HasPrefix(trimmed, "SELECT ") || strings.HasPrefix(trimmed, "RESET ") || strings.HasPrefix(trimmed, "\\") {
+			continue
+		}
+		ddl.WriteString(line)
+		ddl.WriteString("\n")
+	}
+	return strings.TrimSpace(ddl.String()), nil
+}
+
 // findDDLForObject finds the most relevant DDL command for a schema object from the log.
 func findDDLForObject(ddlLog []tracker.DDLEntry, objectName string) string {
 	// Search backwards for the most recent DDL affecting this object
@@ -206,6 +264,30 @@ func containsObjectRef(command, objectName string) bool {
 		}
 	}
 	return false
+}
+
+// coveredByPgDump checks if an index/constraint object name appears in any pg_dump DDL
+// we already captured for an added table. The pg_dump output includes CREATE INDEX
+// and ALTER TABLE ... ADD CONSTRAINT statements that reference the object by name.
+func coveredByPgDump(objectName string, pgDumpSQL map[string]string) bool {
+	// Extract the short name (last part after the last dot)
+	// e.g. "public.rebate_external_figures_pkey" -> "rebate_external_figures_pkey"
+	parts := strings.Split(objectName, ".")
+	shortName := parts[len(parts)-1]
+	for _, sql := range pgDumpSQL {
+		if strings.Contains(sql, shortName) {
+			return true
+		}
+	}
+	return false
+}
+
+// sortChanges orders schema changes so tables come before indexes and constraints.
+func sortChanges(changes []diff.SchemaChange) {
+	kindOrder := map[string]int{"table": 0, "column": 1, "index": 2, "constraint": 2}
+	sort.SliceStable(changes, func(i, j int) bool {
+		return kindOrder[changes[i].ObjectKind] < kindOrder[changes[j].ObjectKind]
+	})
 }
 
 func splitObjectName(name string) []string {
