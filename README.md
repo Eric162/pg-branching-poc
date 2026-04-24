@@ -56,7 +56,7 @@ pg-branch delete feature-auth
 | `status` | Show current branch and pending DDL changes |
 | `diff [branch]` | Schema and data diff vs parent |
 | `log [-v] [branch]` | DDL change history |
-| `merge <branch> [--apply] [--resolve=branch\|main]` | Three-way merge into parent |
+| `merge <branch> [--apply] [--resolve=branch\|main] [--no-lock]` | Three-way merge into parent |
 | `connect [name]` | Print connection URL |
 | `delete <name>` | Drop branch database |
 | `version` | Print version |
@@ -102,6 +102,8 @@ branch-point snapshot
    - If both sides made different changes → **conflict**
 
 Merge is **dry-run by default**. Pass `--apply` to execute. All changes run in a transaction — rollback on error.
+
+Concurrent merges of the same branch/main pair are serialised via a Postgres session-level advisory lock. Pass `--no-lock` to skip it (e.g. for scripted demos where you know nothing else is merging).
 
 ### Conflict Resolution
 

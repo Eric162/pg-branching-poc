@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // CreateDatabase creates a new empty database.
@@ -54,6 +55,66 @@ func (c *Conn) DatabaseExists(ctx context.Context, dbName string) (bool, error) 
 		dbName,
 	).Scan(&exists)
 	return exists, err
+}
+
+// AdvisoryLock represents a held session-level advisory lock. The lock is
+// pinned to a single pooled connection; releasing it returns the connection
+// to the pool. pg_advisory_lock is per-session, so acquiring and releasing
+// via arbitrary pool checkouts would be unsafe — callers must keep the
+// handle alive for the duration of the protected operation.
+type AdvisoryLock struct {
+	conn    *pgxpool.Conn
+	key     string
+	held    bool
+	release func()
+}
+
+// TryAdvisoryLock attempts to acquire a session-level advisory lock keyed by
+// the given string. Returns a held AdvisoryLock on success. If another
+// session already holds the lock, returns (nil, nil) with no error — callers
+// decide whether that's fatal or a soft miss.
+//
+// hashtextextended is 64-bit (PG 11+) and its output fits pg_try_advisory_lock(bigint).
+func (c *Conn) TryAdvisoryLock(ctx context.Context, key string) (*AdvisoryLock, error) {
+	conn, err := c.pool.Acquire(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("acquire connection for advisory lock: %w", err)
+	}
+
+	var got bool
+	err = conn.QueryRow(ctx,
+		"SELECT pg_try_advisory_lock(hashtextextended($1, 0))", key,
+	).Scan(&got)
+	if err != nil {
+		conn.Release()
+		return nil, fmt.Errorf("try advisory lock: %w", err)
+	}
+	if !got {
+		conn.Release()
+		return nil, nil
+	}
+
+	return &AdvisoryLock{
+		conn:    conn,
+		key:     key,
+		held:    true,
+		release: conn.Release,
+	}, nil
+}
+
+// Release drops the advisory lock and returns the pinned connection to the
+// pool. Safe to call multiple times; a nil receiver is a no-op so callers
+// can `defer lock.Release(ctx)` without a nil check.
+func (l *AdvisoryLock) Release(ctx context.Context) {
+	if l == nil || !l.held {
+		return
+	}
+	l.held = false
+	// Best-effort: if unlock fails, the session-end cleanup on connection
+	// close will still release the lock. We swallow the error rather than
+	// pretend the caller can do something useful with it.
+	_, _ = l.conn.Exec(ctx, "SELECT pg_advisory_unlock(hashtextextended($1, 0))", l.key)
+	l.release()
 }
 
 // ListDatabases returns all non-template database names.

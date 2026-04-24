@@ -11,6 +11,7 @@ var (
 	mergeInto    string
 	mergeApply   bool
 	mergeResolve string
+	mergeNoLock  bool
 )
 
 var mergeCmd = &cobra.Command{
@@ -65,6 +66,7 @@ var mergeCmd = &cobra.Command{
 			DryRun:     !mergeApply,
 			Resolve:    resolveMode,
 			Progress:   stderrProgress("Checksumming"),
+			NoLock:     mergeNoLock,
 		}
 
 		result, err := merge.Execute(ctx, adminConn, opts)
@@ -84,5 +86,6 @@ func init() {
 	mergeCmd.Flags().StringVar(&mergeInto, "into", "", "Target database to merge into (default: parent of branch)")
 	mergeCmd.Flags().BoolVar(&mergeApply, "apply", false, "Apply the merge (default: dry-run)")
 	mergeCmd.Flags().StringVar(&mergeResolve, "resolve", "", "Conflict resolution: 'branch' or 'main'")
+	mergeCmd.Flags().BoolVar(&mergeNoLock, "no-lock", false, "Skip the advisory lock that serialises concurrent merges")
 	rootCmd.AddCommand(mergeCmd)
 }

@@ -24,12 +24,16 @@ const (
 
 // Options configures a merge operation.
 type Options struct {
-	BranchName  string
-	BranchDB    string
-	MainDB      string
-	DryRun      bool
-	Resolve     ResolveMode
-	Progress    diff.ProgressFunc
+	BranchName string
+	BranchDB   string
+	MainDB     string
+	DryRun     bool
+	Resolve    ResolveMode
+	Progress   diff.ProgressFunc
+	// NoLock skips the Postgres advisory lock that normally serialises merges
+	// of the same branch/main pair. Use with care — concurrent merges can
+	// interleave DDL and corrupt the merged state.
+	NoLock bool
 }
 
 // Execute performs a three-way merge from branch into main.
@@ -50,6 +54,23 @@ func Execute(ctx context.Context, adminConn *pg.Conn, opts Options) (*MergeResul
 		return nil, fmt.Errorf("connect to main: %w", err)
 	}
 	defer mainConn.Close()
+
+	// Serialise concurrent merges of the same branch/main pair. The lock is
+	// session-scoped and held on a dedicated pooled connection for the whole
+	// operation; --no-lock opts out for users who know they're the only
+	// merger (e.g. scripted demos) and don't want the extra round-trips.
+	if !opts.NoLock {
+		lockKey := fmt.Sprintf("pgbranch:merge:%s:%s", opts.MainDB, opts.BranchName)
+		lock, err := mainConn.TryAdvisoryLock(ctx, lockKey)
+		if err != nil {
+			return nil, fmt.Errorf("acquire merge lock: %w", err)
+		}
+		if lock == nil {
+			return nil, fmt.Errorf("another merge of %q into %q is in progress (advisory lock held). Wait for it to finish or pass --no-lock to override",
+				opts.BranchName, opts.MainDB)
+		}
+		defer lock.Release(ctx)
+	}
 
 	branchConn, err := adminConn.ConnectToDatabase(ctx, opts.BranchDB)
 	if err != nil {

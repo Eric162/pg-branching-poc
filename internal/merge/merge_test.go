@@ -383,6 +383,63 @@ func TestMergeWithDataChanges(t *testing.T) {
 	}
 }
 
+func TestMergeAdvisoryLockBlocksConcurrent(t *testing.T) {
+	ctx := context.Background()
+	adminConn, sourceDB := setupMergeTest(t, ctx)
+	defer adminConn.Close()
+	defer func() {
+		_ = adminConn.DropDatabase(ctx, "pgbr_mergebranch")
+		_ = adminConn.DropDatabase(ctx, sourceDB)
+	}()
+
+	if err := branch.Create(ctx, adminConn, "mergebranch", sourceDB, "pgbr_mergebranch"); err != nil {
+		t.Fatalf("create branch: %v", err)
+	}
+
+	// Hold the same advisory lock on a separate connection to simulate a
+	// concurrent merge that's still running.
+	mainConn, err := adminConn.ConnectToDatabase(ctx, sourceDB)
+	if err != nil {
+		t.Fatalf("connect to main: %v", err)
+	}
+	defer mainConn.Close()
+
+	lockKey := "pgbranch:merge:" + sourceDB + ":mergebranch"
+	held, err := mainConn.TryAdvisoryLock(ctx, lockKey)
+	if err != nil {
+		t.Fatalf("pre-acquire lock: %v", err)
+	}
+	if held == nil {
+		t.Fatal("expected to acquire the lock in test setup")
+	}
+	defer held.Release(ctx)
+
+	// A merge of the same branch/main should now refuse to run.
+	_, err = merge.Execute(ctx, adminConn, merge.Options{
+		BranchName: "mergebranch",
+		BranchDB:   "pgbr_mergebranch",
+		MainDB:     sourceDB,
+		DryRun:     true,
+	})
+	if err == nil {
+		t.Fatal("expected merge to fail while advisory lock is held")
+	}
+	if !strings.Contains(err.Error(), "in progress") {
+		t.Errorf("expected 'in progress' error, got: %v", err)
+	}
+
+	// --no-lock should bypass and succeed.
+	if _, err := merge.Execute(ctx, adminConn, merge.Options{
+		BranchName: "mergebranch",
+		BranchDB:   "pgbr_mergebranch",
+		MainDB:     sourceDB,
+		DryRun:     true,
+		NoLock:     true,
+	}); err != nil {
+		t.Errorf("merge with NoLock should bypass the lock, got: %v", err)
+	}
+}
+
 func TestMergeResolveModeBranch(t *testing.T) {
 	ctx := context.Background()
 	adminConn, sourceDB := setupMergeTest(t, ctx)
