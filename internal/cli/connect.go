@@ -12,7 +12,6 @@ var connectCmd = &cobra.Command{
 	Short: "Print connection string for a branch (or current branch)",
 	Args:  cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		ctx := cmd.Context()
 		u := mustResolveURL()
 
 		state, err := loadStateFromCwd()
@@ -39,13 +38,9 @@ var connectCmd = &cobra.Command{
 			dbName = state.MainDB
 		}
 
-		conn, err := pg.Connect(ctx, u)
-		if err != nil {
-			return fmt.Errorf("connect: %w", err)
-		}
-		defer conn.Close()
-
-		connURL, err := conn.URLForDatabase(dbName)
+		// Purely URL rewriting — no Postgres round-trip needed to print a
+		// connection string.
+		connURL, err := pg.URLForDatabase(u, dbName)
 		if err != nil {
 			return err
 		}
