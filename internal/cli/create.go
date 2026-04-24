@@ -33,8 +33,8 @@ var createCmd = &cobra.Command{
 			return fmt.Errorf("no parent database. Run 'pg-branch init' first or use --from")
 		}
 
-		// Branch DB name: prefix + branch name
-		branchDBName := "pgbr_" + name
+		// Branch DB name: shared prefix + branch name
+		branchDBName := config.BranchDBPrefix + name
 
 		// Check if branch already exists in state
 		if _, exists := state.GetBranch(name); exists {

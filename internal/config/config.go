@@ -8,23 +8,14 @@ import (
 )
 
 const (
-	ConfigFileName = ".pg-branch.yaml"
-	StateFileName  = ".pg-branch.state.json"
+	StateFileName = ".pg-branch.state.json"
+
+	// BranchDBPrefix is prepended to the user-supplied branch name to form
+	// the actual Postgres database name (e.g. "my-feature" → "pgbr_my-feature").
+	// Callers must use this rather than hard-coding the prefix so the
+	// create / delete / connect / status paths stay in sync.
+	BranchDBPrefix = "pgbr_"
 )
-
-// Config represents the .pg-branch.yaml configuration.
-type Config struct {
-	PGURL        string `json:"pg_url"`
-	BranchPrefix string `json:"branch_prefix"`
-}
-
-// DefaultConfig returns config with sensible defaults.
-func DefaultConfig() *Config {
-	return &Config{
-		PGURL:        "postgresql://localhost:5432/postgres",
-		BranchPrefix: "pgbr_",
-	}
-}
 
 // BranchState tracks metadata for a single branch.
 type BranchState struct {
