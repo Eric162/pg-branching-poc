@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/pg-branch/pg-branch/internal/merge"
 	"github.com/spf13/cobra"
@@ -69,6 +70,7 @@ var mergeCmd = &cobra.Command{
 			Progress:   stderrProgress("Checksumming"),
 			NoLock:     mergeNoLock,
 			NoData:     mergeNoData,
+			Stderr:     os.Stderr,
 		}
 
 		result, err := merge.Execute(ctx, adminConn, opts)

@@ -1,6 +1,7 @@
 package merge_test
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"strings"
@@ -676,6 +677,48 @@ func TestMergeAdvisoryLockBlocksConcurrent(t *testing.T) {
 		NoLock:     true,
 	}); err != nil {
 		t.Errorf("merge with NoLock should bypass the lock, got: %v", err)
+	}
+}
+
+// TestMergeProgressGoesToOptionsStderr confirms phase labels route through
+// Options.Stderr rather than the process' os.Stderr, so callers can silence
+// merge output or capture it in tests.
+func TestMergeProgressGoesToOptionsStderr(t *testing.T) {
+	ctx := context.Background()
+	adminConn, sourceDB := setupMergeTest(t, ctx)
+	defer adminConn.Close()
+	defer func() {
+		_ = adminConn.DropDatabase(ctx, "pgbr_mergebranch")
+		_ = adminConn.DropDatabase(ctx, sourceDB)
+	}()
+
+	if err := branch.Create(ctx, adminConn, "mergebranch", sourceDB, "pgbr_mergebranch"); err != nil {
+		t.Fatalf("create branch: %v", err)
+	}
+
+	var buf bytes.Buffer
+	if _, err := merge.Execute(ctx, adminConn, merge.Options{
+		BranchName: "mergebranch",
+		BranchDB:   "pgbr_mergebranch",
+		MainDB:     sourceDB,
+		DryRun:     true,
+		Stderr:     &buf,
+	}); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+
+	out := buf.String()
+	for _, want := range []string{
+		"Loading branch-point snapshot",
+		"Snapshotting main schema",
+		"Snapshotting branch schema",
+		"Computing schema diff",
+		"Checksumming main",
+		"Checksumming branch",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected progress output to contain %q, got:\n%s", want, out)
+		}
 	}
 }
 

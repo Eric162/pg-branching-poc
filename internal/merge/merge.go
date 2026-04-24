@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"sort"
@@ -41,6 +42,10 @@ type Options struct {
 	// considered. Useful when you want to review data changes manually or
 	// when branch and main are intentionally diverging.
 	NoData bool
+	// Stderr receives phase-label progress output ("Loading branch-point
+	// snapshot...", etc.). Defaults to os.Stderr when nil; set to
+	// io.Discard to silence or to a bytes.Buffer in tests.
+	Stderr io.Writer
 }
 
 // Execute performs a three-way merge from branch into main.
@@ -54,6 +59,11 @@ type Options struct {
 //  6. If not dry-run, apply within a transaction
 func Execute(ctx context.Context, adminConn *pg.Conn, opts Options) (*MergeResult, error) {
 	result := &MergeResult{DryRun: opts.DryRun}
+
+	stderr := opts.Stderr
+	if stderr == nil {
+		stderr = os.Stderr
+	}
 
 	// Connect to both databases
 	mainConn, err := adminConn.ConnectToDatabase(ctx, opts.MainDB)
@@ -86,7 +96,7 @@ func Execute(ctx context.Context, adminConn *pg.Conn, opts Options) (*MergeResul
 	defer branchConn.Close()
 
 	// 1. Load branch-point snapshot
-	fmt.Fprintf(os.Stderr, "  Loading branch-point snapshot...\n")
+	fmt.Fprintf(stderr, "  Loading branch-point snapshot...\n")
 	snapshotData, err := tracker.LoadSnapshot(ctx, mainConn, opts.BranchName)
 	if err != nil {
 		return nil, fmt.Errorf("load branch-point snapshot: %w", err)
@@ -97,19 +107,19 @@ func Execute(ctx context.Context, adminConn *pg.Conn, opts Options) (*MergeResul
 	}
 
 	// 2. Get current schemas
-	fmt.Fprintf(os.Stderr, "  Snapshotting main schema...\n")
+	fmt.Fprintf(stderr, "  Snapshotting main schema...\n")
 	mainSchema, err := mainConn.TakeSchemaSnapshot(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("snapshot main schema: %w", err)
 	}
-	fmt.Fprintf(os.Stderr, "  Snapshotting branch schema...\n")
+	fmt.Fprintf(stderr, "  Snapshotting branch schema...\n")
 	branchSchema, err := branchConn.TakeSchemaSnapshot(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("snapshot branch schema: %w", err)
 	}
 
 	// 3. Compute changes on each side
-	fmt.Fprintf(os.Stderr, "  Computing schema diff...\n")
+	fmt.Fprintf(stderr, "  Computing schema diff...\n")
 	mainChanges := diff.SchemaDiff(branchPointSchema, mainSchema)
 	branchChanges := diff.SchemaDiff(branchPointSchema, branchSchema)
 
@@ -124,12 +134,12 @@ func Execute(ctx context.Context, adminConn *pg.Conn, opts Options) (*MergeResul
 
 	// 6. Data merge — compare checksums (skippable via --no-data)
 	if !opts.NoData {
-		fmt.Fprintf(os.Stderr, "  Checksumming main...\n")
+		fmt.Fprintf(stderr, "  Checksumming main...\n")
 		mainChecksums, err := diff.ComputeTableChecksums(ctx, mainConn, opts.Progress)
 		if err != nil {
 			return nil, fmt.Errorf("main checksums: %w", err)
 		}
-		fmt.Fprintf(os.Stderr, "  Checksumming branch...\n")
+		fmt.Fprintf(stderr, "  Checksumming branch...\n")
 		branchChecksums, err := diff.ComputeTableChecksums(ctx, branchConn, opts.Progress)
 		if err != nil {
 			return nil, fmt.Errorf("branch checksums: %w", err)
