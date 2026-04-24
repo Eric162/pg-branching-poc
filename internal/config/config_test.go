@@ -117,6 +117,29 @@ func TestLoadStateThenOverwriteMainDB(t *testing.T) {
 	}
 }
 
+// TestStateRoundTripPreservesServerURL ensures ServerURL survives marshal
+// round-trips so non-default Postgres servers (different host/port/user) can
+// be reconnected across invocations without the old localhost:5432 guess.
+func TestStateRoundTripPreservesServerURL(t *testing.T) {
+	dir := t.TempDir()
+	s := &config.State{
+		MainDB:    "myapp_dev",
+		ServerURL: "postgresql://alice:secret@pg.example.com:6432/",
+		Branches:  make(map[string]config.BranchState),
+	}
+	s.SetPath(dir)
+	if err := s.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	loaded, err := config.LoadState(dir)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if loaded.ServerURL != s.ServerURL {
+		t.Errorf("ServerURL: got %q, want %q", loaded.ServerURL, s.ServerURL)
+	}
+}
+
 func TestRemoveBranch(t *testing.T) {
 	state := &config.State{
 		CurrentBranch: "feature-x",

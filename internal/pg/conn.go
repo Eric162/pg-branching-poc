@@ -61,11 +61,30 @@ func (c *Conn) Exec(ctx context.Context, sql string, args ...any) error {
 
 // URLForDatabase returns a connection URL for a different database on the same server.
 func (c *Conn) URLForDatabase(dbName string) (string, error) {
-	u, err := url.Parse(c.url)
+	return URLForDatabase(c.url, dbName)
+}
+
+// URLForDatabase returns a copy of the URL with its database path set to
+// dbName. Exposed as a package-level function so callers can reuse a stored
+// URL (e.g. from state) without first opening a connection.
+func URLForDatabase(baseURL, dbName string) (string, error) {
+	u, err := url.Parse(baseURL)
 	if err != nil {
 		return "", fmt.Errorf("parse connection URL: %w", err)
 	}
 	u.Path = "/" + dbName
+	return u.String(), nil
+}
+
+// ServerURL returns the connection URL with its database path stripped, so
+// callers can store "which server to reach" separately from "which database
+// on that server". Credentials, host, and port are preserved.
+func ServerURL(dbURL string) (string, error) {
+	u, err := url.Parse(dbURL)
+	if err != nil {
+		return "", fmt.Errorf("parse connection URL: %w", err)
+	}
+	u.Path = "/"
 	return u.String(), nil
 }
 

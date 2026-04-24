@@ -37,8 +37,15 @@ type BranchState struct {
 type State struct {
 	CurrentBranch string                 `json:"current_branch"`
 	MainDB        string                 `json:"main_db"`
-	Branches      map[string]BranchState `json:"branches"`
-	path          string
+	// ServerURL stores the connection URL captured at init time with the
+	// database path stripped (e.g. "postgresql://user:pw@host:5432/"). It's
+	// used to reconstruct URLs for the main DB and for any branch DB on the
+	// same server without guessing host/port/user. Empty for state files
+	// that predate this field — callers should fall back to a sensible
+	// localhost default in that case.
+	ServerURL string                 `json:"server_url,omitempty"`
+	Branches  map[string]BranchState `json:"branches"`
+	path      string
 }
 
 // LoadState reads state from disk. Returns empty state if file doesn't exist.

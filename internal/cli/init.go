@@ -53,6 +53,11 @@ var initCmd = &cobra.Command{
 			return fmt.Errorf("load state: %w", err)
 		}
 		state.MainDB = dbName
+		serverURL, err := pg.ServerURL(u)
+		if err != nil {
+			return fmt.Errorf("extract server URL: %w", err)
+		}
+		state.ServerURL = serverURL
 		state.SetPath(cwd)
 		if err := state.Save(); err != nil {
 			return fmt.Errorf("save state: %w", err)

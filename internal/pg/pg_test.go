@@ -131,3 +131,45 @@ func TestURLForDatabase(t *testing.T) {
 		t.Error("expected non-empty URL")
 	}
 }
+
+func TestURLForDatabasePackageLevel(t *testing.T) {
+	cases := []struct {
+		name, in, db, want string
+	}{
+		{"simple", "postgresql://localhost:5432/postgres", "mydb", "postgresql://localhost:5432/mydb"},
+		{"with credentials", "postgresql://alice:secret@pg.example.com:6432/old", "new", "postgresql://alice:secret@pg.example.com:6432/new"},
+		{"with query params", "postgresql://localhost/postgres?sslmode=require", "mydb", "postgresql://localhost/mydb?sslmode=require"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := pg.URLForDatabase(c.in, c.db)
+			if err != nil {
+				t.Fatalf("err: %v", err)
+			}
+			if got != c.want {
+				t.Errorf("got %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+func TestServerURL(t *testing.T) {
+	cases := []struct {
+		name, in, want string
+	}{
+		{"strip db", "postgresql://localhost:5432/postgres", "postgresql://localhost:5432/"},
+		{"preserve creds", "postgresql://alice:secret@pg.example.com:6432/old", "postgresql://alice:secret@pg.example.com:6432/"},
+		{"preserve query params", "postgresql://localhost/postgres?sslmode=require", "postgresql://localhost/?sslmode=require"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := pg.ServerURL(c.in)
+			if err != nil {
+				t.Fatalf("err: %v", err)
+			}
+			if got != c.want {
+				t.Errorf("got %q, want %q", got, c.want)
+			}
+		})
+	}
+}
