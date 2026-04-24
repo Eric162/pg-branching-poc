@@ -106,6 +106,111 @@ func TestSchemaDiffDetectsRemovedTable(t *testing.T) {
 	}
 }
 
+func TestSchemaDiffDetectsAddedIndex(t *testing.T) {
+	base := &pg.SchemaSnapshot{
+		Indexes: []pg.IndexInfo{
+			{Schema: "public", Table: "users", Name: "users_pkey", Definition: "CREATE UNIQUE INDEX users_pkey ON users (id)", IsPrimary: true, IsUnique: true},
+		},
+	}
+	current := &pg.SchemaSnapshot{
+		Indexes: []pg.IndexInfo{
+			{Schema: "public", Table: "users", Name: "users_pkey", Definition: "CREATE UNIQUE INDEX users_pkey ON users (id)", IsPrimary: true, IsUnique: true},
+			{Schema: "public", Table: "users", Name: "idx_users_email", Definition: "CREATE INDEX idx_users_email ON users (email)"},
+		},
+	}
+
+	changes := diff.SchemaDiff(base, current)
+	found := false
+	for _, c := range changes {
+		if c.ObjectKind == "index" && c.ObjectName == "public.idx_users_email" && c.Type == diff.Added {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected to detect added index 'public.idx_users_email'")
+	}
+}
+
+func TestSchemaDiffDetectsModifiedIndex(t *testing.T) {
+	base := &pg.SchemaSnapshot{
+		Indexes: []pg.IndexInfo{
+			{Schema: "public", Name: "idx_users_email", Definition: "CREATE INDEX idx_users_email ON users (email)"},
+		},
+	}
+	current := &pg.SchemaSnapshot{
+		Indexes: []pg.IndexInfo{
+			{Schema: "public", Name: "idx_users_email", Definition: "CREATE INDEX idx_users_email ON users (lower(email))"},
+		},
+	}
+
+	changes := diff.SchemaDiff(base, current)
+	found := false
+	for _, c := range changes {
+		if c.ObjectKind == "index" && c.Type == diff.Modified {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected to detect modified index definition")
+	}
+}
+
+func TestSchemaDiffDetectsRemovedIndex(t *testing.T) {
+	base := &pg.SchemaSnapshot{
+		Indexes: []pg.IndexInfo{
+			{Schema: "public", Name: "idx_gone"},
+			{Schema: "public", Name: "idx_kept"},
+		},
+	}
+	current := &pg.SchemaSnapshot{
+		Indexes: []pg.IndexInfo{
+			{Schema: "public", Name: "idx_kept"},
+		},
+	}
+
+	changes := diff.SchemaDiff(base, current)
+	found := false
+	for _, c := range changes {
+		if c.ObjectKind == "index" && c.ObjectName == "public.idx_gone" && c.Type == diff.Removed {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected to detect removed index 'public.idx_gone'")
+	}
+}
+
+func TestSchemaDiffDetectsConstraintChanges(t *testing.T) {
+	base := &pg.SchemaSnapshot{
+		Constraints: []pg.ConstraintInfo{
+			{Schema: "public", Table: "orders", Name: "orders_user_fk", Type: "FOREIGN KEY", Definition: "FOREIGN KEY (user_id) REFERENCES users(id)"},
+		},
+	}
+	current := &pg.SchemaSnapshot{
+		Constraints: []pg.ConstraintInfo{
+			{Schema: "public", Table: "orders", Name: "orders_user_fk", Type: "FOREIGN KEY", Definition: "FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE"},
+			{Schema: "public", Table: "orders", Name: "orders_total_check", Type: "CHECK", Definition: "CHECK (total >= 0)"},
+		},
+	}
+
+	changes := diff.SchemaDiff(base, current)
+	var sawAdded, sawModified bool
+	for _, c := range changes {
+		if c.ObjectKind == "constraint" && c.ObjectName == "public.orders_total_check" && c.Type == diff.Added {
+			sawAdded = true
+		}
+		if c.ObjectKind == "constraint" && c.ObjectName == "public.orders_user_fk" && c.Type == diff.Modified {
+			sawModified = true
+		}
+	}
+	if !sawAdded {
+		t.Error("expected added CHECK constraint")
+	}
+	if !sawModified {
+		t.Error("expected modified FK constraint definition")
+	}
+}
+
 func TestSchemaDiffDetectsModifiedColumn(t *testing.T) {
 	base := &pg.SchemaSnapshot{
 		Tables: []pg.TableInfo{
