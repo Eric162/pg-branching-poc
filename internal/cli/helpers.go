@@ -17,14 +17,23 @@ func loadStateFromCwd() (*config.State, error) {
 	return config.LoadState(cwd)
 }
 
-// connectAdmin connects to the 'postgres' maintenance database on the same server.
-func connectAdmin(ctx context.Context, pgURL string) (*pg.Conn, error) {
-	conn, err := pg.Connect(ctx, pgURL)
-	if err != nil {
-		return nil, err
+// adminDBName returns the maintenance database to connect to for
+// CREATE/DROP DATABASE. Defaults to "postgres" — the conventional
+// PostgreSQL maintenance DB — but honours PG_BRANCH_ADMIN_DB so users on
+// servers that don't expose "postgres" (some managed providers, or setups
+// where the app role has no access to it) can point pg-branch at a DB
+// their role can actually connect to. Example: PG_BRANCH_ADMIN_DB=defaultdb.
+func adminDBName() string {
+	if name := os.Getenv("PG_BRANCH_ADMIN_DB"); name != "" {
+		return name
 	}
-	adminURL, err := conn.URLForDatabase("postgres")
-	conn.Close()
+	return "postgres"
+}
+
+// connectAdmin connects to the maintenance database on the same server as
+// the given URL. The DB name comes from adminDBName().
+func connectAdmin(ctx context.Context, pgURL string) (*pg.Conn, error) {
+	adminURL, err := pg.URLForDatabase(pgURL, adminDBName())
 	if err != nil {
 		return nil, err
 	}

@@ -8,6 +8,10 @@ import "github.com/spf13/cobra"
 // the previous one — cobra keeps parsed flag values on the package-level vars.
 func RootForTest() *cobra.Command { return rootCmd }
 
+// AdminDBNameForTest exposes adminDBName() so tests can assert on its env-var
+// resolution without needing to trigger a live Postgres connect.
+func AdminDBNameForTest() string { return adminDBName() }
+
 // ResetFlagsForTest clears every flag variable defined in this package so
 // tests observe a clean slate. Add new entries here whenever a command gains
 // a flag, otherwise that flag will leak across tests.

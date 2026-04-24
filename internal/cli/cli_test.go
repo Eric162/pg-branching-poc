@@ -233,6 +233,20 @@ func TestStatusNoCurrentBranch(t *testing.T) {
 	}
 }
 
+func TestAdminDBNameDefault(t *testing.T) {
+	t.Setenv("PG_BRANCH_ADMIN_DB", "")
+	if got := cli.AdminDBNameForTest(); got != "postgres" {
+		t.Errorf("default admin DB: got %q, want %q", got, "postgres")
+	}
+}
+
+func TestAdminDBNameFromEnv(t *testing.T) {
+	t.Setenv("PG_BRANCH_ADMIN_DB", "defaultdb")
+	if got := cli.AdminDBNameForTest(); got != "defaultdb" {
+		t.Errorf("env-provided admin DB: got %q, want %q", got, "defaultdb")
+	}
+}
+
 func TestStateFileWritten(t *testing.T) {
 	// Sanity: SetPath uses the working directory the CLI sees, which tests
 	// alter via t.Chdir. A save should land there, not somewhere stale from

@@ -141,6 +141,8 @@ Connection URL resolution order:
 2. `PG_BRANCH_URL` environment variable
 3. `.pg-branch.state.json` in current directory
 
+`CREATE DATABASE` must be issued from a connection to a database other than the one being branched — pg-branch uses `postgres` by default. If your role can't reach `postgres` (some managed providers, e.g. DigitalOcean expose `defaultdb` instead), set `PG_BRANCH_ADMIN_DB` to the name of a database the role can connect to.
+
 ## Limitations
 
 - `CREATE DATABASE ... TEMPLATE` requires no active connections to the source database. pg-branch terminates other connections automatically, but this can interrupt running queries.
