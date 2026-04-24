@@ -60,12 +60,22 @@ func runCLI(t *testing.T, args ...string) (string, error) {
 	return buf.String(), execErr
 }
 
-// writeState puts a .pg-branch.state.json in dir with the given state, so
-// tests can exercise code paths that read persisted branch metadata without
-// needing a live Postgres.
-func writeState(t *testing.T, dir string, s *config.State) {
+// writeState puts a .pg-branch.state.json in dir with fields copied from the
+// given template. The template is a plain struct literal — using NewState +
+// field assignment inline at every call site would make the tests much
+// noisier — so this helper translates the "declarative fixture" style into
+// a properly-initialised State with a save path.
+func writeState(t *testing.T, dir string, template *config.State) {
 	t.Helper()
-	s.SetPath(dir)
+	s := config.NewState(dir)
+	s.MainDB = template.MainDB
+	s.CurrentBranch = template.CurrentBranch
+	s.ServerURL = template.ServerURL
+	if template.Branches != nil {
+		for k, v := range template.Branches {
+			s.Branches[k] = v
+		}
+	}
 	if err := s.Save(); err != nil {
 		t.Fatalf("write state: %v", err)
 	}
@@ -248,8 +258,8 @@ func TestAdminDBNameFromEnv(t *testing.T) {
 }
 
 func TestStateFileWritten(t *testing.T) {
-	// Sanity: SetPath uses the working directory the CLI sees, which tests
-	// alter via t.Chdir. A save should land there, not somewhere stale from
+	// Sanity: NewState uses the directory the test passes in, which tests
+	// couple to t.Chdir. A save should land there, not somewhere stale from
 	// a previous test.
 	dir := t.TempDir()
 	t.Chdir(dir)

@@ -11,13 +11,9 @@ import (
 func TestStateRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 
-	// Create state
-	state := &config.State{
-		MainDB:        "myapp_dev",
-		CurrentBranch: "feature-x",
-		Branches:      make(map[string]config.BranchState),
-	}
-	state.SetPath(dir)
+	state := config.NewState(dir)
+	state.MainDB = "myapp_dev"
+	state.CurrentBranch = "feature-x"
 	state.AddBranch("feature-x", config.BranchState{
 		DBName:    "pgbr_feature_x",
 		ParentDB:  "myapp_dev",
@@ -79,12 +75,9 @@ func TestLoadStateThenOverwriteMainDB(t *testing.T) {
 	dir := t.TempDir()
 
 	// Seed state with a branch and a current branch marker.
-	seed := &config.State{
-		MainDB:        "myapp_dev",
-		CurrentBranch: "feature-x",
-		Branches:      make(map[string]config.BranchState),
-	}
-	seed.SetPath(dir)
+	seed := config.NewState(dir)
+	seed.MainDB = "myapp_dev"
+	seed.CurrentBranch = "feature-x"
 	seed.AddBranch("feature-x", config.BranchState{
 		DBName:    "pgbr_feature_x",
 		ParentDB:  "myapp_dev",
@@ -100,7 +93,6 @@ func TestLoadStateThenOverwriteMainDB(t *testing.T) {
 		t.Fatalf("load state: %v", err)
 	}
 	loaded.MainDB = "myapp_dev"
-	loaded.SetPath(dir)
 	if err := loaded.Save(); err != nil {
 		t.Fatalf("resave state: %v", err)
 	}
@@ -122,12 +114,9 @@ func TestLoadStateThenOverwriteMainDB(t *testing.T) {
 // be reconnected across invocations without the old localhost:5432 guess.
 func TestStateRoundTripPreservesServerURL(t *testing.T) {
 	dir := t.TempDir()
-	s := &config.State{
-		MainDB:    "myapp_dev",
-		ServerURL: "postgresql://alice:secret@pg.example.com:6432/",
-		Branches:  make(map[string]config.BranchState),
-	}
-	s.SetPath(dir)
+	s := config.NewState(dir)
+	s.MainDB = "myapp_dev"
+	s.ServerURL = "postgresql://alice:secret@pg.example.com:6432/"
 	if err := s.Save(); err != nil {
 		t.Fatalf("save: %v", err)
 	}
@@ -138,6 +127,19 @@ func TestStateRoundTripPreservesServerURL(t *testing.T) {
 	if loaded.ServerURL != s.ServerURL {
 		t.Errorf("ServerURL: got %q, want %q", loaded.ServerURL, s.ServerURL)
 	}
+}
+
+// TestSaveWithoutPathPanics pins the contract that bare &State{} literals
+// can't be saved — callers get a clear programming error rather than a
+// silent write to an empty path.
+func TestSaveWithoutPathPanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic when saving a State with no path")
+		}
+	}()
+	bare := &config.State{Branches: map[string]config.BranchState{}}
+	_ = bare.Save()
 }
 
 func TestRemoveBranch(t *testing.T) {

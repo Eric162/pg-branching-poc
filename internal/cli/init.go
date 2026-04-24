@@ -58,7 +58,8 @@ var initCmd = &cobra.Command{
 			return fmt.Errorf("extract server URL: %w", err)
 		}
 		state.ServerURL = serverURL
-		state.SetPath(cwd)
+		// No SetPath call here: LoadState already initialised state.path to
+		// the cwd-relative state file.
 		if err := state.Save(); err != nil {
 			return fmt.Errorf("save state: %w", err)
 		}

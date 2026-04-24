@@ -26,8 +26,8 @@ type BranchState struct {
 
 // State represents the .pg-branch.state.json file.
 type State struct {
-	CurrentBranch string                 `json:"current_branch"`
-	MainDB        string                 `json:"main_db"`
+	CurrentBranch string `json:"current_branch"`
+	MainDB        string `json:"main_db"`
 	// ServerURL stores the connection URL captured at init time with the
 	// database path stripped (e.g. "postgresql://user:pw@host:5432/"). It's
 	// used to reconstruct URLs for the main DB and for any branch DB on the
@@ -39,7 +39,19 @@ type State struct {
 	path      string
 }
 
-// LoadState reads state from disk. Returns empty state if file doesn't exist.
+// NewState constructs an empty State targeting dir for future Save() calls.
+// Prefer this over a &State{} literal so the save path is always populated —
+// a State built with a bare literal will panic or write to a wrong location
+// on Save. Use LoadState when a state file may already exist on disk.
+func NewState(dir string) *State {
+	return &State{
+		Branches: make(map[string]BranchState),
+		path:     filepath.Join(dir, StateFileName),
+	}
+}
+
+// LoadState reads state from disk. Returns an empty state targeting dir if
+// the file doesn't exist, so callers can unconditionally modify and Save().
 func LoadState(dir string) (*State, error) {
 	p := filepath.Join(dir, StateFileName)
 	data, err := os.ReadFile(p)
@@ -63,18 +75,18 @@ func LoadState(dir string) (*State, error) {
 	return &s, nil
 }
 
-// Save writes state to disk.
+// Save writes state to disk. Panics if the state wasn't built with NewState
+// or LoadState — that's a programming error caught loudly rather than a
+// silent empty-path write.
 func (s *State) Save() error {
+	if s.path == "" {
+		panic("config.State.Save called on a State with no path — construct via NewState or LoadState")
+	}
 	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal state: %w", err)
 	}
 	return os.WriteFile(s.path, data, 0644)
-}
-
-// SetPath sets the file path for saving.
-func (s *State) SetPath(dir string) {
-	s.path = filepath.Join(dir, StateFileName)
 }
 
 // AddBranch records a new branch in state.
