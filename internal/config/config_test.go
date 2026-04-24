@@ -71,6 +71,52 @@ func TestLoadStateMissingFile(t *testing.T) {
 	}
 }
 
+// TestLoadStateThenOverwriteMainDB models the init-reinit flow: loading an
+// existing state file and updating only MainDB must preserve existing branches
+// and the current_branch marker. Init previously replaced the file with a
+// fresh empty State, silently dropping branch entries.
+func TestLoadStateThenOverwriteMainDB(t *testing.T) {
+	dir := t.TempDir()
+
+	// Seed state with a branch and a current branch marker.
+	seed := &config.State{
+		MainDB:        "myapp_dev",
+		CurrentBranch: "feature-x",
+		Branches:      make(map[string]config.BranchState),
+	}
+	seed.SetPath(dir)
+	seed.AddBranch("feature-x", config.BranchState{
+		DBName:    "pgbr_feature_x",
+		ParentDB:  "myapp_dev",
+		CreatedAt: "2026-04-15T10:00:00Z",
+	})
+	if err := seed.Save(); err != nil {
+		t.Fatalf("save seed: %v", err)
+	}
+
+	// Simulate re-running `init` against the same main DB.
+	loaded, err := config.LoadState(dir)
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+	loaded.MainDB = "myapp_dev"
+	loaded.SetPath(dir)
+	if err := loaded.Save(); err != nil {
+		t.Fatalf("resave state: %v", err)
+	}
+
+	reloaded, err := config.LoadState(dir)
+	if err != nil {
+		t.Fatalf("reload state: %v", err)
+	}
+	if _, ok := reloaded.GetBranch("feature-x"); !ok {
+		t.Error("re-init dropped the existing branch")
+	}
+	if reloaded.CurrentBranch != "feature-x" {
+		t.Errorf("re-init cleared current_branch: got %q", reloaded.CurrentBranch)
+	}
+}
+
 func TestRemoveBranch(t *testing.T) {
 	state := &config.State{
 		CurrentBranch: "feature-x",

@@ -42,15 +42,17 @@ var initCmd = &cobra.Command{
 			return err
 		}
 
-		// Save state file
+		// Load the existing state file (if any) before writing so re-running
+		// init on the same DB doesn't wipe the branch list or current_branch.
 		cwd, err := os.Getwd()
 		if err != nil {
 			return err
 		}
-		state := &config.State{
-			MainDB:   dbName,
-			Branches: make(map[string]config.BranchState),
+		state, err := config.LoadState(cwd)
+		if err != nil {
+			return fmt.Errorf("load state: %w", err)
 		}
+		state.MainDB = dbName
 		state.SetPath(cwd)
 		if err := state.Save(); err != nil {
 			return fmt.Errorf("save state: %w", err)
