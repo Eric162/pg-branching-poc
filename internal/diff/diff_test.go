@@ -221,6 +221,117 @@ func TestCompareDataDetectsChanges(t *testing.T) {
 	}
 }
 
+// TestChecksumStableAcrossThreshold asserts that the same table data produces
+// the same checksum whether the threshold treats it as "small" (single quick
+// scan) or "large" (progress-reporting scan). Prior to unifying the two paths,
+// the streaming version summed int64 with Go wrap-around while the SQL version
+// summed into arbitrary-precision numeric — so identical data could produce
+// different digests depending on table size.
+func TestChecksumStableAcrossThreshold(t *testing.T) {
+	ctx := context.Background()
+	adminConn, err := pg.Connect(ctx, testPGURL(t))
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer adminConn.Close()
+
+	testDB := "pgbranch_test_threshold"
+	_ = adminConn.DropDatabase(ctx, testDB)
+	defer func() { _ = adminConn.DropDatabase(ctx, testDB) }()
+
+	if err := adminConn.CreateDatabase(ctx, testDB); err != nil {
+		t.Fatalf("create test db: %v", err)
+	}
+	conn, err := adminConn.ConnectToDatabase(ctx, testDB)
+	if err != nil {
+		t.Fatalf("connect to test db: %v", err)
+	}
+	defer conn.Close()
+
+	// Seed ~200 rows so both paths have something non-trivial to sum.
+	if err := conn.Exec(ctx, `
+		CREATE TABLE items (id SERIAL PRIMARY KEY, name TEXT, val INT);
+		INSERT INTO items (name, val)
+		SELECT 'item-' || g::text, (g * 7919) % 1000000
+		FROM generate_series(1, 200) g;
+	`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// Record and restore the threshold so we don't leak state to other tests.
+	origThreshold := diff.LargeTableThresholdForTest()
+	defer diff.SetLargeTableThresholdForTest(origThreshold)
+
+	progress := func(_, _ int, _ string) {}
+
+	diff.SetLargeTableThresholdForTest(1_000_000) // small-path
+	small, err := diff.ComputeTableChecksums(ctx, conn, progress)
+	if err != nil {
+		t.Fatalf("small-path checksums: %v", err)
+	}
+
+	diff.SetLargeTableThresholdForTest(1) // large-path on everything
+	large, err := diff.ComputeTableChecksums(ctx, conn, progress)
+	if err != nil {
+		t.Fatalf("large-path checksums: %v", err)
+	}
+
+	if len(small) != len(large) {
+		t.Fatalf("row count differs between paths: small=%d large=%d", len(small), len(large))
+	}
+	for i := range small {
+		if small[i].Table != large[i].Table {
+			t.Fatalf("table order differs: %q vs %q", small[i].Table, large[i].Table)
+		}
+		if small[i].Checksum != large[i].Checksum {
+			t.Errorf("checksum for %s.%s diverges between paths:\n  small: %s\n  large: %s",
+				small[i].Schema, small[i].Table, small[i].Checksum, large[i].Checksum)
+		}
+	}
+}
+
+// TestChecksumEmptyTable pins the "no rows" sentinel — it must be stable and
+// non-empty so downstream comparators don't treat empty tables as missing.
+func TestChecksumEmptyTable(t *testing.T) {
+	ctx := context.Background()
+	adminConn, err := pg.Connect(ctx, testPGURL(t))
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer adminConn.Close()
+
+	testDB := "pgbranch_test_empty"
+	_ = adminConn.DropDatabase(ctx, testDB)
+	defer func() { _ = adminConn.DropDatabase(ctx, testDB) }()
+
+	if err := adminConn.CreateDatabase(ctx, testDB); err != nil {
+		t.Fatalf("create test db: %v", err)
+	}
+	conn, err := adminConn.ConnectToDatabase(ctx, testDB)
+	if err != nil {
+		t.Fatalf("connect to test db: %v", err)
+	}
+	defer conn.Close()
+
+	if err := conn.Exec(ctx, "CREATE TABLE empty (id INT)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	checksums, err := diff.ComputeTableChecksums(ctx, conn, nil)
+	if err != nil {
+		t.Fatalf("checksums: %v", err)
+	}
+	if len(checksums) != 1 {
+		t.Fatalf("expected 1 checksum, got %d", len(checksums))
+	}
+	if checksums[0].RowCount != 0 {
+		t.Errorf("expected row count 0, got %d", checksums[0].RowCount)
+	}
+	if checksums[0].Checksum == "" {
+		t.Error("empty-table checksum should be a stable sentinel, not empty string")
+	}
+}
+
 func TestFormatChanges(t *testing.T) {
 	changes := []diff.SchemaChange{
 		{Type: diff.Added, ObjectKind: "table", ObjectName: "public.posts", Detail: "table public.posts added (2 columns)"},

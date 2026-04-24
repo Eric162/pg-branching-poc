@@ -4,12 +4,17 @@ import (
 	"context"
 	"crypto/md5"
 	"fmt"
+	"math/big"
 	"strings"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/pg-branch/pg-branch/internal/pg"
 )
 
-const largeTableThreshold = 50000
+// largeTableThreshold is the row count above which per-row progress is reported.
+// Exposed as a var (not const) so tests can force the streaming path on small tables.
+var largeTableThreshold int64 = 50000
 
 // TableChecksum represents the checksum of a table's data.
 type TableChecksum struct {
@@ -55,10 +60,7 @@ func ComputeTableChecksums(ctx context.Context, conn *pg.Conn, progress Progress
 }
 
 func computeSingleChecksum(ctx context.Context, conn *pg.Conn, schema, table string, tableIdx, tableTotal int, progress ProgressFunc) (*TableChecksum, error) {
-	fqn := fmt.Sprintf("%s.%s",
-		pgQuoteIdent(schema),
-		pgQuoteIdent(table),
-	)
+	fqn := pgx.Identifier{schema, table}.Sanitize()
 
 	// Get row count
 	var rowCount int64
@@ -67,15 +69,7 @@ func computeSingleChecksum(ctx context.Context, conn *pg.Conn, schema, table str
 		return nil, fmt.Errorf("count rows: %w", err)
 	}
 
-	// For large tables, stream row hashes for progress reporting.
-	// For small tables, use a single server-side query (faster, no round-trips).
-	// Both use ctid ordering so checksums match regardless of path.
-	var cs string
-	if rowCount >= largeTableThreshold && progress != nil {
-		cs, err = checksumStreaming(ctx, conn, fqn, schema, table, rowCount, tableIdx, tableTotal, progress)
-	} else {
-		cs, err = checksumSingleQuery(ctx, conn, fqn)
-	}
+	cs, err := computeChecksum(ctx, conn, fqn, schema, table, rowCount, tableIdx, tableTotal, progress)
 	if err != nil {
 		return nil, err
 	}
@@ -88,26 +82,22 @@ func computeSingleChecksum(ctx context.Context, conn *pg.Conn, schema, table str
 	}, nil
 }
 
-// checksumSingleQuery computes an order-independent checksum in a single SQL statement.
-// Uses SUM of numeric hash values so no sorting is needed.
-func checksumSingleQuery(ctx context.Context, conn *pg.Conn, fqn string) (string, error) {
-	var checksum *string
-	err := conn.QueryRow(ctx, fmt.Sprintf(
-		"SELECT md5(SUM(('x' || substr(md5(t::text), 1, 16))::bit(64)::bigint)::text) FROM %s t",
-		fqn,
-	)).Scan(&checksum)
-	if err != nil {
-		return "", fmt.Errorf("compute checksum: %w", err)
+// computeChecksum streams per-row 64-bit hashes and combines them with an
+// arbitrary-precision sum, then hashes the resulting decimal string. The sum
+// is done in Go with math/big so the result matches what Postgres' SUM(bigint)
+// (which returns numeric) would compute for the same rows — this keeps the
+// checksum stable regardless of table size, and a divergence between "small"
+// and "large" tables can't creep back in.
+//
+// Progress is reported per row for tables above largeTableThreshold; smaller
+// tables only report once at completion.
+func computeChecksum(ctx context.Context, conn *pg.Conn, fqn, schema, table string, rowCount int64, tableIdx, tableTotal int, progress ProgressFunc) (string, error) {
+	if rowCount == 0 {
+		// Empty table — stable sentinel matches md5("0") so that an empty table
+		// always hashes to the same string regardless of which path we took.
+		return fmt.Sprintf("%x", md5.Sum([]byte("0"))), nil
 	}
-	if checksum == nil {
-		return "", nil
-	}
-	return *checksum, nil
-}
 
-// checksumStreaming fetches per-row hashes without ORDER BY (rows stream immediately)
-// and computes an order-independent checksum by summing hash values in Go.
-func checksumStreaming(ctx context.Context, conn *pg.Conn, fqn, schema, table string, rowCount int64, tableIdx, tableTotal int, progress ProgressFunc) (string, error) {
 	rows, err := conn.Query(ctx, fmt.Sprintf(
 		"SELECT ('x' || substr(md5(t::text), 1, 16))::bit(64)::bigint FROM %s t", fqn,
 	))
@@ -116,8 +106,11 @@ func checksumStreaming(ctx context.Context, conn *pg.Conn, fqn, schema, table st
 	}
 	defer rows.Close()
 
-	var sum int64
+	sum := new(big.Int)
+	tmp := new(big.Int)
 	var processed int64
+
+	reportLarge := rowCount >= largeTableThreshold && progress != nil
 	reportInterval := rowCount / 100
 	if reportInterval < 1000 {
 		reportInterval = 1000
@@ -128,9 +121,10 @@ func checksumStreaming(ctx context.Context, conn *pg.Conn, fqn, schema, table st
 		if err := rows.Scan(&hashVal); err != nil {
 			return "", fmt.Errorf("scan row hash: %w", err)
 		}
-		sum += hashVal
+		tmp.SetInt64(hashVal)
+		sum.Add(sum, tmp)
 		processed++
-		if processed%reportInterval == 0 {
+		if reportLarge && processed%reportInterval == 0 {
 			progress(tableIdx, tableTotal, fmt.Sprintf("%s.%s (%s/%s rows)",
 				schema, table, formatCount(processed), formatCount(rowCount)))
 		}
@@ -139,8 +133,7 @@ func checksumStreaming(ctx context.Context, conn *pg.Conn, fqn, schema, table st
 		return "", fmt.Errorf("iterate rows: %w", err)
 	}
 
-	// Hash the final sum to produce a stable checksum string
-	return fmt.Sprintf("%x", md5.Sum([]byte(fmt.Sprintf("%d", sum)))), nil
+	return fmt.Sprintf("%x", md5.Sum([]byte(sum.String()))), nil
 }
 
 // formatCount formats a number with comma separators.
@@ -243,8 +236,4 @@ func checksumMap(checksums []TableChecksum) map[string]TableChecksum {
 		m[cs.Schema+"."+cs.Table] = cs
 	}
 	return m
-}
-
-func pgQuoteIdent(s string) string {
-	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 }
