@@ -3,6 +3,7 @@ package merge_test
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/pg-branch/pg-branch/internal/branch"
@@ -229,7 +230,7 @@ func TestMergeConflict_BothSidesModify(t *testing.T) {
 	srcConn.Close()
 
 	// Merge — should detect that both sides modified 'users' table but different columns
-	// This should NOT conflict because they're different columns
+	// This should NOT conflict because they're different columns.
 	result, err := merge.Execute(ctx, adminConn, merge.Options{
 		BranchName: "mergebranch",
 		BranchDB:   "pgbr_mergebranch",
@@ -240,10 +241,21 @@ func TestMergeConflict_BothSidesModify(t *testing.T) {
 		t.Fatalf("merge: %v", err)
 	}
 
-	// The branch added 'bio', main added 'age' — these shouldn't conflict
-	// because they're different object names (public.users.bio vs public.users.age)
-	t.Logf("Schema ops: %d, Conflicts: %d", len(result.SchemaOps), len(result.Conflicts))
-	t.Logf("Summary:\n%s", result.Summary())
+	if result.HasConflicts() {
+		t.Errorf("different columns on the same table should not conflict; got %d conflicts:\n%s",
+			len(result.Conflicts), result.Summary())
+	}
+
+	// The branch's 'bio' should be scheduled for replay.
+	var sawBio bool
+	for _, op := range result.SchemaOps {
+		if op.Status == "ok" && strings.Contains(op.Description, "bio") {
+			sawBio = true
+		}
+	}
+	if !sawBio {
+		t.Errorf("expected a schema op for 'bio'; got:\n%s", result.Summary())
+	}
 }
 
 func TestMergeConflict_SameColumnBothSides(t *testing.T) {
@@ -280,26 +292,33 @@ func TestMergeConflict_SameColumnBothSides(t *testing.T) {
 	}
 	srcConn.Close()
 
-	// Merge should detect conflict on same column name
+	// Merge should detect conflict on same column name with different types.
 	result, err := merge.Execute(ctx, adminConn, merge.Options{
 		BranchName: "mergebranch",
 		BranchDB:   "pgbr_mergebranch",
 		MainDB:     sourceDB,
 		DryRun:     true,
 	})
-	// Expect error or conflicts
+	// Dry-run doesn't fail on conflicts (--apply would). The merge must return
+	// a result and report the collision.
 	if err != nil {
-		// Conflict error is acceptable
-		t.Logf("merge returned error (expected): %v", err)
+		t.Fatalf("dry-run merge should not error on conflicts: %v", err)
 	}
-	if result != nil {
-		t.Logf("Conflicts: %d", len(result.Conflicts))
-		if result.HasConflicts() {
-			for _, c := range result.Conflicts {
-				t.Logf("  Conflict: %s %s (branch: %s, main: %s)",
-					c.Type, c.ObjectName, c.BranchSide, c.MainSide)
-			}
+	if result == nil {
+		t.Fatal("expected a result, got nil")
+	}
+	if !result.HasConflicts() {
+		t.Fatalf("expected a conflict on public.users.status; got none:\n%s", result.Summary())
+	}
+
+	var sawStatus bool
+	for _, c := range result.Conflicts {
+		if c.ObjectName == "public.users.status" && c.Type == merge.SchemaConflict {
+			sawStatus = true
 		}
+	}
+	if !sawStatus {
+		t.Errorf("expected SchemaConflict on public.users.status; got %+v", result.Conflicts)
 	}
 }
 
@@ -341,12 +360,26 @@ func TestMergeWithDataChanges(t *testing.T) {
 	}
 
 	if len(result.DataOps) == 0 {
-		t.Error("expected data operations for inserted row")
+		t.Fatal("expected data operations for inserted row")
 	}
 
-	t.Logf("Data ops: %d", len(result.DataOps))
+	var sawUsers bool
 	for _, op := range result.DataOps {
-		t.Logf("  %s %s %s", op.Operation, op.Table, op.RowKey)
+		if op.Table == "public.users" {
+			sawUsers = true
+			if !strings.Contains(op.RowKey, "3 rows") || !strings.Contains(op.RowKey, "2 rows") {
+				t.Errorf("expected row-count detail '3 rows (branch) vs 2 rows (main)', got %q", op.RowKey)
+			}
+		}
+	}
+	if !sawUsers {
+		t.Errorf("expected a data op for public.users, got: %+v", result.DataOps)
+	}
+
+	// Data-merge is not applied in the current implementation — the summary
+	// must flag that to the user so they don't assume data was synced.
+	if !result.PendingDataChanges() {
+		t.Errorf("expected PendingDataChanges()=true when branch has new rows")
 	}
 }
 
