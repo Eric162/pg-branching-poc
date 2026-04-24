@@ -9,10 +9,6 @@ import (
 	"github.com/pg-branch/pg-branch/internal/pg"
 )
 
-func envOrEmpty(key string) string {
-	return os.Getenv(key)
-}
-
 func loadStateFromCwd() (*config.State, error) {
 	cwd, err := os.Getwd()
 	if err != nil {

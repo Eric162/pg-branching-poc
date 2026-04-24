@@ -102,12 +102,6 @@ func ReadDDLLog(ctx context.Context, conn *pg.Conn) ([]DDLEntry, error) {
 	return entries, rows.Err()
 }
 
-// SaveSnapshot stores a schema snapshot for a branch in the main DB's tracking table.
-func SaveSnapshot(ctx context.Context, conn *pg.Conn, branchName string, snapshotJSON []byte) error {
-	sql := `UPDATE _pgbranch.branches SET snapshot_data = $1 WHERE name = $2`
-	return conn.Exec(ctx, sql, snapshotJSON, branchName)
-}
-
 // LoadSnapshot retrieves the schema snapshot for a branch.
 func LoadSnapshot(ctx context.Context, conn *pg.Conn, branchName string) ([]byte, error) {
 	var data []byte

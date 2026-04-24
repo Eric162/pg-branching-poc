@@ -139,9 +139,7 @@ func buildSchemaMergeOps(result *MergeResult, mainChanges, branchChanges []diff.
 	sortChanges(branchChanges)
 
 	// For each branch change, check if main also changed the same object
-	branchObjectsHandled := make(map[string]bool)
 	for _, bc := range branchChanges {
-		branchObjectsHandled[bc.ObjectName] = true
 		mc, mainAlsoChanged := mainChangeMap[bc.ObjectName]
 
 		if !mainAlsoChanged {
@@ -257,9 +255,8 @@ func findDDLForObject(ddlLog []tracker.DDLEntry, objectName string) string {
 func containsObjectRef(command, objectName string) bool {
 	// Simple substring match — good enough for most cases.
 	// Object names like "public.users" appear in DDL commands.
-	parts := splitObjectName(objectName)
-	for _, part := range parts {
-		if len(part) > 0 && contains(command, part) {
+	for _, part := range splitObjectName(objectName) {
+		if part != "" && strings.Contains(command, part) {
 			return true
 		}
 	}
@@ -290,8 +287,9 @@ func sortChanges(changes []diff.SchemaChange) {
 	})
 }
 
+// splitObjectName returns the full name plus every dot-delimited suffix.
+// "public.users.email" → ["public.users.email", "email", "users.email"].
 func splitObjectName(name string) []string {
-	// "public.users.email" -> ["public", "users", "email"]
 	result := []string{name}
 	for i := len(name) - 1; i >= 0; i-- {
 		if name[i] == '.' {
@@ -299,19 +297,6 @@ func splitObjectName(name string) []string {
 		}
 	}
 	return result
-}
-
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && searchString(s, substr)
-}
-
-func searchString(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }
 
 // buildDataMergeOps compares data between branch and main.

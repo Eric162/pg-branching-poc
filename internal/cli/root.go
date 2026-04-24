@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"os"
+
 	"github.com/spf13/cobra"
 )
 
@@ -35,7 +37,7 @@ func resolveURL() string {
 		return pgURL
 	}
 	// Check env
-	if u := envOrEmpty("PG_BRANCH_URL"); u != "" {
+	if u := os.Getenv("PG_BRANCH_URL"); u != "" {
 		return u
 	}
 	// Try state file
