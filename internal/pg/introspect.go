@@ -167,6 +167,66 @@ func (c *Conn) ListIndexes(ctx context.Context) ([]IndexInfo, error) {
 	return indexes, rows.Err()
 }
 
+// PrimaryKeyColumns returns the column names forming the primary key of the
+// given table, in key-part order. Returns (nil, nil) if the table has no
+// primary key — callers should treat that as "can't be merged by PK" rather
+// than an error.
+func (c *Conn) PrimaryKeyColumns(ctx context.Context, schema, table string) ([]string, error) {
+	rows, err := c.Query(ctx, `
+		SELECT a.attname
+		FROM pg_index i
+		JOIN pg_class t    ON t.oid = i.indrelid
+		JOIN pg_namespace n ON n.oid = t.relnamespace
+		JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(i.indkey)
+		WHERE i.indisprimary
+		  AND n.nspname = $1
+		  AND t.relname = $2
+		ORDER BY array_position(i.indkey, a.attnum)`,
+		schema, table,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("lookup primary key: %w", err)
+	}
+	defer rows.Close()
+
+	var cols []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		cols = append(cols, name)
+	}
+	return cols, rows.Err()
+}
+
+// TableColumnNames returns every column name of the given table in ordinal
+// order. Used when we need to SELECT / INSERT all columns without hardcoding
+// the schema.
+func (c *Conn) TableColumnNames(ctx context.Context, schema, table string) ([]string, error) {
+	rows, err := c.Query(ctx, `
+		SELECT column_name
+		FROM information_schema.columns
+		WHERE table_schema = $1 AND table_name = $2
+		ORDER BY ordinal_position`,
+		schema, table,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list columns: %w", err)
+	}
+	defer rows.Close()
+
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	return names, rows.Err()
+}
+
 // ListConstraints returns all user table constraints.
 func (c *Conn) ListConstraints(ctx context.Context) ([]ConstraintInfo, error) {
 	rows, err := c.Query(ctx, `

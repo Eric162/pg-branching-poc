@@ -25,10 +25,9 @@ func TestSummaryAppliedWithUnappliedDataOps(t *testing.T) {
 	r := &merge.MergeResult{
 		SchemaOps: []merge.SchemaOp{{Description: "column x.y added", SQL: "ALTER TABLE x ADD COLUMN y INT", Status: "ok"}},
 		DataOps: []merge.DataOp{{
-			Table:     "public.users",
-			Operation: "SYNC",
-			RowKey:    "3 rows (branch) vs 2 rows (main)",
-			// no SQL → not actually applied
+			Table:     "public.events",
+			Operation: "SYNC", // no-PK fallback — not applied
+			RowKey:    "5 rows (branch) vs 3 rows (main) (no primary key)",
 		}},
 		Applied: true,
 	}
@@ -44,6 +43,27 @@ func TestSummaryAppliedWithUnappliedDataOps(t *testing.T) {
 	}
 }
 
+func TestSummaryAppliedWithExecutableDataOps(t *testing.T) {
+	r := &merge.MergeResult{
+		SchemaOps: []merge.SchemaOp{{Description: "column x.y added", SQL: "ALTER TABLE x ADD COLUMN y INT", Status: "ok"}},
+		DataOps: []merge.DataOp{{
+			Table:     "public.users",
+			Operation: "INSERT_PK",
+			RowKey:    "3 rows (branch) vs 2 rows (main)",
+			SQL:       "inserted 1 row(s)",
+			Status:    "ok",
+		}},
+		Applied: true,
+	}
+	out := r.Summary()
+	if strings.Contains(out, "[NOT APPLIED]") {
+		t.Errorf("INSERT_PK plan should not be flagged [NOT APPLIED], got:\n%s", out)
+	}
+	if !strings.Contains(out, "Merge applied successfully.") {
+		t.Errorf("expected plain success message when all data ops are executable, got:\n%s", out)
+	}
+}
+
 func TestPendingDataChanges(t *testing.T) {
 	cases := []struct {
 		name string
@@ -51,8 +71,8 @@ func TestPendingDataChanges(t *testing.T) {
 		want bool
 	}{
 		{name: "empty", ops: nil, want: false},
-		{name: "all have SQL", ops: []merge.DataOp{{SQL: "UPDATE ..."}, {SQL: "INSERT ..."}}, want: false},
-		{name: "one missing SQL", ops: []merge.DataOp{{SQL: "UPDATE ..."}, {SQL: ""}}, want: true},
+		{name: "all executable", ops: []merge.DataOp{{Operation: "INSERT_PK"}, {Operation: "INSERT_PK"}}, want: false},
+		{name: "one sync", ops: []merge.DataOp{{Operation: "INSERT_PK"}, {Operation: "SYNC"}}, want: true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

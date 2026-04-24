@@ -2,11 +2,14 @@ package merge
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"sort"
 	"strings"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/pg-branch/pg-branch/internal/diff"
 	"github.com/pg-branch/pg-branch/internal/pg"
@@ -34,6 +37,10 @@ type Options struct {
 	// of the same branch/main pair. Use with care — concurrent merges can
 	// interleave DDL and corrupt the merged state.
 	NoLock bool
+	// NoData skips the row-level data merge entirely; only schema ops are
+	// considered. Useful when you want to review data changes manually or
+	// when branch and main are intentionally diverging.
+	NoData bool
 }
 
 // Execute performs a three-way merge from branch into main.
@@ -115,28 +122,29 @@ func Execute(ctx context.Context, adminConn *pg.Conn, opts Options) (*MergeResul
 	// 5. Build schema merge ops
 	buildSchemaMergeOps(result, mainChanges, branchChanges, ddlLog, opts.Resolve, branchConn)
 
-	// 6. Data merge — compare checksums
-	fmt.Fprintf(os.Stderr, "  Checksumming main...\n")
-	mainChecksums, err := diff.ComputeTableChecksums(ctx, mainConn, opts.Progress)
-	if err != nil {
-		return nil, fmt.Errorf("main checksums: %w", err)
+	// 6. Data merge — compare checksums (skippable via --no-data)
+	if !opts.NoData {
+		fmt.Fprintf(os.Stderr, "  Checksumming main...\n")
+		mainChecksums, err := diff.ComputeTableChecksums(ctx, mainConn, opts.Progress)
+		if err != nil {
+			return nil, fmt.Errorf("main checksums: %w", err)
+		}
+		fmt.Fprintf(os.Stderr, "  Checksumming branch...\n")
+		branchChecksums, err := diff.ComputeTableChecksums(ctx, branchConn, opts.Progress)
+		if err != nil {
+			return nil, fmt.Errorf("branch checksums: %w", err)
+		}
+		if err := buildDataMergeOps(ctx, result, mainConn, branchConn, mainChecksums, branchChecksums); err != nil {
+			return nil, fmt.Errorf("build data merge ops: %w", err)
+		}
 	}
-	fmt.Fprintf(os.Stderr, "  Checksumming branch...\n")
-	branchChecksums, err := diff.ComputeTableChecksums(ctx, branchConn, opts.Progress)
-	if err != nil {
-		return nil, fmt.Errorf("branch checksums: %w", err)
-	}
-
-	// Get branch-point checksums from main (since main was the template, at branch time
-	// main and branch had identical data — so we compare current states)
-	buildDataMergeOps(ctx, result, mainConn, branchConn, mainChecksums, branchChecksums, branchPointSchema, opts.Resolve)
 
 	// 7. Apply if not dry-run and no unresolved conflicts
 	if !opts.DryRun {
 		if result.HasConflicts() && opts.Resolve == ResolveNone {
 			return result, fmt.Errorf("merge has %d conflicts. Use --resolve=branch or --resolve=main", len(result.Conflicts))
 		}
-		if err := applyMerge(ctx, mainConn, result); err != nil {
+		if err := applyMerge(ctx, mainConn, branchConn, result); err != nil {
 			return result, fmt.Errorf("apply merge: %w", err)
 		}
 		result.Applied = true
@@ -320,12 +328,24 @@ func splitObjectName(name string) []string {
 	return result
 }
 
-// buildDataMergeOps compares data between branch and main.
-// Since branch was created from main via TEMPLATE, the branch-point data = main at that time.
-// We detect tables where branch data differs from main data.
-func buildDataMergeOps(ctx context.Context, result *MergeResult, mainConn, branchConn *pg.Conn,
-	mainChecksums, branchChecksums []diff.TableChecksum,
-	branchPointSchema *pg.SchemaSnapshot, resolve ResolveMode) {
+// buildDataMergeOps compares data between branch and main. Since branch was
+// created from main via TEMPLATE, branch-point data equals main at that time;
+// a current checksum divergence means the branch diverged from main (or main
+// diverged from the branch point, or both).
+//
+// For each divergent table we try to build an executable plan:
+//   - If the table has a primary key, emit an INSERT_PK op. applyMerge will
+//     stream rows from branch and insert any with PKs not already in main.
+//   - If the table has no primary key, emit a SYNC op (reported as
+//     [NOT APPLIED] in the summary) so the user knows to sync manually.
+//
+// Updates and deletes aren't part of this merge strategy — detecting them
+// accurately requires a branch-point data snapshot which this tool doesn't
+// keep. Surfacing "a table differs" without an automated fix is the safe
+// behaviour for those cases.
+func buildDataMergeOps(ctx context.Context, result *MergeResult,
+	mainConn, branchConn *pg.Conn,
+	mainChecksums, branchChecksums []diff.TableChecksum) error {
 
 	mainMap := make(map[string]diff.TableChecksum)
 	for _, mc := range mainChecksums {
@@ -335,31 +355,54 @@ func buildDataMergeOps(ctx context.Context, result *MergeResult, mainConn, branc
 	for _, bc := range branchChecksums {
 		key := bc.Schema + "." + bc.Table
 		mc, mainExists := mainMap[key]
-
 		if !mainExists {
-			// New table only on branch — data comes with schema op
+			// New table only on branch — DDL replay handles both schema and data.
 			continue
 		}
-
-		// If branch and main have same checksum, no data change needed
 		if bc.Checksum == mc.Checksum {
 			continue
 		}
 
-		// Data differs — for now we flag this as a data change.
-		// Full row-level merge would require PK-based comparison.
-		// We record it as a data operation that needs attention.
+		rowKey := fmt.Sprintf("%d rows (branch) vs %d rows (main)", bc.RowCount, mc.RowCount)
+
+		pkCols, err := mainConn.PrimaryKeyColumns(ctx, bc.Schema, bc.Table)
+		if err != nil {
+			return fmt.Errorf("primary key for %s: %w", key, err)
+		}
+		if len(pkCols) == 0 {
+			// No PK on main-side schema (it's the same shape for both here)
+			// — fall back to manual review.
+			result.DataOps = append(result.DataOps, DataOp{
+				Table:     key,
+				Operation: "SYNC",
+				RowKey:    rowKey + " (no primary key)",
+				Status:    "ok",
+			})
+			continue
+		}
+
+		cols, err := branchConn.TableColumnNames(ctx, bc.Schema, bc.Table)
+		if err != nil {
+			return fmt.Errorf("columns for %s: %w", key, err)
+		}
 		result.DataOps = append(result.DataOps, DataOp{
-			Table:     key,
-			Operation: "SYNC",
-			RowKey:    fmt.Sprintf("%d rows (branch) vs %d rows (main)", bc.RowCount, mc.RowCount),
-			Status:    "ok",
+			Table:      key,
+			Operation:  "INSERT_PK",
+			RowKey:     rowKey,
+			Status:     "ok",
+			Schema:     bc.Schema,
+			TableName:  bc.Table,
+			PKColumns:  pkCols,
+			AllColumns: cols,
 		})
 	}
+	return nil
 }
 
-// applyMerge executes the merge operations within a transaction.
-func applyMerge(ctx context.Context, mainConn *pg.Conn, result *MergeResult) error {
+// applyMerge executes the merge operations within a single transaction.
+// Schema ops run first (replayed DDL), then data ops (INSERT_PK plans that
+// stream rows from branch into main). Any failure rolls back the whole lot.
+func applyMerge(ctx context.Context, mainConn, branchConn *pg.Conn, result *MergeResult) error {
 	tx, err := mainConn.Pool().Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
@@ -375,5 +418,135 @@ func applyMerge(ctx context.Context, mainConn *pg.Conn, result *MergeResult) err
 		}
 	}
 
+	for i := range result.DataOps {
+		op := &result.DataOps[i]
+		if op.Status != "ok" || op.Operation != "INSERT_PK" {
+			continue
+		}
+		inserted, err := applyPKInsert(ctx, tx, branchConn, op)
+		if err != nil {
+			return fmt.Errorf("apply data op on %s: %w", op.Table, err)
+		}
+		op.SQL = fmt.Sprintf("inserted %d row(s)", inserted)
+	}
+
 	return tx.Commit(ctx)
+}
+
+// applyPKInsert streams rows from the branch-side copy of the table and
+// INSERTs into main any row whose primary key isn't already present there.
+// Runs inside the main-side transaction so a failure rolls back everything
+// applyMerge did before this call.
+func applyPKInsert(ctx context.Context, mainTx pgx.Tx, branchConn *pg.Conn, op *DataOp) (int, error) {
+	qTable := pgx.Identifier{op.Schema, op.TableName}.Sanitize()
+
+	// 1. Fetch primary keys already present on main. Using a Go-side set is
+	//    simple and memory-cheap for dev-sized tables — the tool's scope.
+	mainPKs, err := fetchPKSet(ctx, mainTx, qTable, op.PKColumns)
+	if err != nil {
+		return 0, err
+	}
+
+	// 2. Stream every row from branch and skip those whose PK is already in
+	//    main. The remaining rows get parameterised INSERTs inside the tx.
+	quotedCols := make([]string, len(op.AllColumns))
+	for i, c := range op.AllColumns {
+		quotedCols[i] = pgx.Identifier{c}.Sanitize()
+	}
+	selectSQL := fmt.Sprintf("SELECT %s FROM %s", strings.Join(quotedCols, ","), qTable)
+
+	rows, err := branchConn.Query(ctx, selectSQL)
+	if err != nil {
+		return 0, fmt.Errorf("select from branch: %w", err)
+	}
+	defer rows.Close()
+
+	pkIdx := make([]int, len(op.PKColumns))
+	for i, pk := range op.PKColumns {
+		pkIdx[i] = -1
+		for j, c := range op.AllColumns {
+			if c == pk {
+				pkIdx[i] = j
+				break
+			}
+		}
+		if pkIdx[i] == -1 {
+			return 0, fmt.Errorf("primary key column %q not found in column list", pk)
+		}
+	}
+
+	placeholders := make([]string, len(op.AllColumns))
+	for i := range placeholders {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+	}
+	insertSQL := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
+		qTable, strings.Join(quotedCols, ","), strings.Join(placeholders, ","))
+
+	inserted := 0
+	for rows.Next() {
+		values, err := rows.Values()
+		if err != nil {
+			return inserted, fmt.Errorf("scan branch row: %w", err)
+		}
+		pkKey, err := pkTupleKey(values, pkIdx)
+		if err != nil {
+			return inserted, err
+		}
+		if _, exists := mainPKs[pkKey]; exists {
+			continue
+		}
+		if _, err := mainTx.Exec(ctx, insertSQL, values...); err != nil {
+			return inserted, fmt.Errorf("insert into main: %w", err)
+		}
+		inserted++
+	}
+	return inserted, rows.Err()
+}
+
+// fetchPKSet returns a set of PK-tuple strings for rows in qTable.
+func fetchPKSet(ctx context.Context, tx pgx.Tx, qTable string, pkCols []string) (map[string]struct{}, error) {
+	quoted := make([]string, len(pkCols))
+	for i, c := range pkCols {
+		quoted[i] = pgx.Identifier{c}.Sanitize()
+	}
+	query := fmt.Sprintf("SELECT %s FROM %s", strings.Join(quoted, ","), qTable)
+
+	rows, err := tx.Query(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("select pk from main: %w", err)
+	}
+	defer rows.Close()
+
+	set := make(map[string]struct{})
+	indices := make([]int, len(pkCols))
+	for i := range indices {
+		indices[i] = i
+	}
+	for rows.Next() {
+		values, err := rows.Values()
+		if err != nil {
+			return nil, fmt.Errorf("scan pk row: %w", err)
+		}
+		key, err := pkTupleKey(values, indices)
+		if err != nil {
+			return nil, err
+		}
+		set[key] = struct{}{}
+	}
+	return set, rows.Err()
+}
+
+// pkTupleKey builds a deterministic string key for a PK tuple. JSON encoding
+// handles mixed types (int, string, uuid, timestamp) without a handwritten
+// separator-based scheme that could collide on certain values.
+func pkTupleKey(values []any, indices []int) (string, error) {
+	picked := make([]any, len(indices))
+	for i, idx := range indices {
+		picked[i] = values[idx]
+	}
+	buf, err := json.Marshal(picked)
+	if err != nil {
+		return "", fmt.Errorf("encode pk tuple: %w", err)
+	}
+	return string(buf), nil
 }

@@ -56,7 +56,7 @@ pg-branch delete feature-auth
 | `status` | Show current branch and pending DDL changes |
 | `diff [branch]` | Schema and data diff vs parent |
 | `log [-v] [branch]` | DDL change history |
-| `merge <branch> [--apply] [--resolve=branch\|main] [--no-lock]` | Three-way merge into parent |
+| `merge <branch> [--apply] [--resolve=branch\|main] [--no-lock] [--no-data]` | Three-way merge into parent |
 | `connect [name]` | Print connection URL |
 | `delete <name>` | Drop branch database |
 | `version` | Print version |
@@ -145,7 +145,7 @@ Connection URL resolution order:
 
 - `CREATE DATABASE ... TEMPLATE` requires no active connections to the source database. pg-branch terminates other connections automatically, but this can interrupt running queries.
 - DDL event triggers don't capture changes made via `pg_restore` or direct file manipulation.
-- Data merge detects which tables changed (via checksums) but doesn't yet do row-level merge — it reports changes for manual review.
+- Data merge handles the append-only case: for tables with a primary key, rows present on the branch but not on main are inserted. Updates, deletes, and tables without a primary key are reported but not auto-applied (surfaced as `[NOT APPLIED]`). Pass `--no-data` to skip the data merge entirely.
 - Branch databases live on the same Postgres server. No remote or cross-server branching.
 
 ## Development

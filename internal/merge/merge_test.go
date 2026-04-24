@@ -370,16 +370,255 @@ func TestMergeWithDataChanges(t *testing.T) {
 			if !strings.Contains(op.RowKey, "3 rows") || !strings.Contains(op.RowKey, "2 rows") {
 				t.Errorf("expected row-count detail '3 rows (branch) vs 2 rows (main)', got %q", op.RowKey)
 			}
+			if op.Operation != "INSERT_PK" {
+				t.Errorf("expected INSERT_PK plan for PK'd table, got %q", op.Operation)
+			}
 		}
 	}
 	if !sawUsers {
 		t.Errorf("expected a data op for public.users, got: %+v", result.DataOps)
 	}
 
-	// Data-merge is not applied in the current implementation — the summary
-	// must flag that to the user so they don't assume data was synced.
+	// public.users has a primary key, so the plan is executable — the
+	// summary should NOT warn about unapplied data.
+	if result.PendingDataChanges() {
+		t.Errorf("expected PendingDataChanges()=false when PK is available, got true; summary:\n%s", result.Summary())
+	}
+}
+
+// TestMergeApply_InsertsNewRows exercises the PK-based data merge end-to-end:
+// branch adds a new row to a PK'd table, --apply runs the merge, and the new
+// row is present on main afterwards. Existing rows in main that aren't on
+// branch are left alone.
+func TestMergeApply_InsertsNewRows(t *testing.T) {
+	ctx := context.Background()
+	adminConn, sourceDB := setupMergeTest(t, ctx)
+	defer adminConn.Close()
+	defer func() {
+		_ = adminConn.DropDatabase(ctx, "pgbr_mergebranch")
+		_ = adminConn.DropDatabase(ctx, sourceDB)
+	}()
+
+	if err := branch.Create(ctx, adminConn, "mergebranch", sourceDB, "pgbr_mergebranch"); err != nil {
+		t.Fatalf("create branch: %v", err)
+	}
+
+	// Insert on branch only.
+	branchConn, err := adminConn.ConnectToDatabase(ctx, "pgbr_mergebranch")
+	if err != nil {
+		t.Fatalf("connect branch: %v", err)
+	}
+	if err := branchConn.Exec(ctx,
+		"INSERT INTO users (name, email) VALUES ('Charlie', 'charlie@example.com')"); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	branchConn.Close()
+
+	result, err := merge.Execute(ctx, adminConn, merge.Options{
+		BranchName: "mergebranch",
+		BranchDB:   "pgbr_mergebranch",
+		MainDB:     sourceDB,
+		DryRun:     false,
+	})
+	if err != nil {
+		t.Fatalf("merge apply: %v", err)
+	}
+	if !result.Applied {
+		t.Fatal("merge should be applied")
+	}
+
+	srcConn, err := adminConn.ConnectToDatabase(ctx, sourceDB)
+	if err != nil {
+		t.Fatalf("connect source: %v", err)
+	}
+	defer srcConn.Close()
+
+	var count int
+	if err := srcConn.QueryRow(ctx, "SELECT count(*) FROM users WHERE email = 'charlie@example.com'").Scan(&count); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("expected Charlie on main after merge, got count=%d", count)
+	}
+
+	// The original rows are still there.
+	var total int
+	if err := srcConn.QueryRow(ctx, "SELECT count(*) FROM users").Scan(&total); err != nil {
+		t.Fatalf("total count: %v", err)
+	}
+	if total != 3 {
+		t.Errorf("expected 3 users on main (Alice, Bob, Charlie), got %d", total)
+	}
+}
+
+// TestMergeApply_SkipsRowsAlreadyOnMain covers the deduplication path: a row
+// that's present on both sides with the same PK is not re-inserted.
+func TestMergeApply_SkipsRowsAlreadyOnMain(t *testing.T) {
+	ctx := context.Background()
+	adminConn, sourceDB := setupMergeTest(t, ctx)
+	defer adminConn.Close()
+	defer func() {
+		_ = adminConn.DropDatabase(ctx, "pgbr_mergebranch")
+		_ = adminConn.DropDatabase(ctx, sourceDB)
+	}()
+
+	if err := branch.Create(ctx, adminConn, "mergebranch", sourceDB, "pgbr_mergebranch"); err != nil {
+		t.Fatalf("create branch: %v", err)
+	}
+
+	// Add Charlie on both sides with the same PK (serial 3 after the two
+	// seed rows on each side). A dry-run reports a divergence because of
+	// the column order but no new PKs — apply should insert 0 rows.
+	branchConn, err := adminConn.ConnectToDatabase(ctx, "pgbr_mergebranch")
+	if err != nil {
+		t.Fatalf("connect branch: %v", err)
+	}
+	if err := branchConn.Exec(ctx,
+		"INSERT INTO users (id, name, email) VALUES (10, 'Charlie', 'charlie@example.com')"); err != nil {
+		t.Fatalf("insert branch: %v", err)
+	}
+	branchConn.Close()
+
+	srcConn, err := adminConn.ConnectToDatabase(ctx, sourceDB)
+	if err != nil {
+		t.Fatalf("connect source: %v", err)
+	}
+	if err := srcConn.Exec(ctx,
+		"INSERT INTO users (id, name, email) VALUES (10, 'Charlie', 'charlie@example.com')"); err != nil {
+		t.Fatalf("insert source: %v", err)
+	}
+	srcConn.Close()
+
+	result, err := merge.Execute(ctx, adminConn, merge.Options{
+		BranchName: "mergebranch",
+		BranchDB:   "pgbr_mergebranch",
+		MainDB:     sourceDB,
+		DryRun:     false,
+	})
+	if err != nil {
+		t.Fatalf("merge apply: %v", err)
+	}
+
+	// Verify main still has just 3 rows (no duplicate-PK conflict).
+	srcConn2, err := adminConn.ConnectToDatabase(ctx, sourceDB)
+	if err != nil {
+		t.Fatalf("connect source: %v", err)
+	}
+	defer srcConn2.Close()
+
+	var total int
+	if err := srcConn2.QueryRow(ctx, "SELECT count(*) FROM users").Scan(&total); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if total != 3 {
+		t.Errorf("expected 3 rows on main (dedupe kept the existing Charlie), got %d", total)
+	}
+	_ = result
+}
+
+// TestMergeTableWithoutPKFallsBackToManualReview: a row diff on a table that
+// has no primary key can't be safely auto-merged, so the op stays [NOT APPLIED].
+func TestMergeTableWithoutPKFallsBackToManualReview(t *testing.T) {
+	ctx := context.Background()
+	adminConn, sourceDB := setupMergeTest(t, ctx)
+	defer adminConn.Close()
+	defer func() {
+		_ = adminConn.DropDatabase(ctx, "pgbr_mergebranch")
+		_ = adminConn.DropDatabase(ctx, sourceDB)
+	}()
+
+	srcConn, err := adminConn.ConnectToDatabase(ctx, sourceDB)
+	if err != nil {
+		t.Fatalf("connect source: %v", err)
+	}
+	if err := srcConn.Exec(ctx, `
+		CREATE TABLE events (at TIMESTAMPTZ, kind TEXT);
+		INSERT INTO events VALUES (now(), 'boot');
+	`); err != nil {
+		t.Fatalf("create events: %v", err)
+	}
+	srcConn.Close()
+
+	if err := branch.Create(ctx, adminConn, "mergebranch", sourceDB, "pgbr_mergebranch"); err != nil {
+		t.Fatalf("create branch: %v", err)
+	}
+
+	branchConn, err := adminConn.ConnectToDatabase(ctx, "pgbr_mergebranch")
+	if err != nil {
+		t.Fatalf("connect branch: %v", err)
+	}
+	if err := branchConn.Exec(ctx, "INSERT INTO events VALUES (now(), 'click')"); err != nil {
+		t.Fatalf("insert branch: %v", err)
+	}
+	branchConn.Close()
+
+	result, err := merge.Execute(ctx, adminConn, merge.Options{
+		BranchName: "mergebranch",
+		BranchDB:   "pgbr_mergebranch",
+		MainDB:     sourceDB,
+		DryRun:     true,
+	})
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+
+	var sawEvents bool
+	for _, op := range result.DataOps {
+		if op.Table == "public.events" {
+			sawEvents = true
+			if op.Operation != "SYNC" {
+				t.Errorf("expected SYNC (no-PK fallback), got %q", op.Operation)
+			}
+			if !strings.Contains(op.RowKey, "no primary key") {
+				t.Errorf("expected no-PK annotation in RowKey, got %q", op.RowKey)
+			}
+		}
+	}
+	if !sawEvents {
+		t.Errorf("expected a data op for public.events, got: %+v", result.DataOps)
+	}
 	if !result.PendingDataChanges() {
-		t.Errorf("expected PendingDataChanges()=true when branch has new rows")
+		t.Error("expected PendingDataChanges()=true for no-PK table")
+	}
+}
+
+// TestMergeNoDataFlag: --no-data skips the checksum step entirely; no data
+// ops are emitted even when rows differ.
+func TestMergeNoDataFlag(t *testing.T) {
+	ctx := context.Background()
+	adminConn, sourceDB := setupMergeTest(t, ctx)
+	defer adminConn.Close()
+	defer func() {
+		_ = adminConn.DropDatabase(ctx, "pgbr_mergebranch")
+		_ = adminConn.DropDatabase(ctx, sourceDB)
+	}()
+
+	if err := branch.Create(ctx, adminConn, "mergebranch", sourceDB, "pgbr_mergebranch"); err != nil {
+		t.Fatalf("create branch: %v", err)
+	}
+
+	branchConn, err := adminConn.ConnectToDatabase(ctx, "pgbr_mergebranch")
+	if err != nil {
+		t.Fatalf("connect branch: %v", err)
+	}
+	if err := branchConn.Exec(ctx,
+		"INSERT INTO users (name, email) VALUES ('Charlie', 'c@x')"); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	branchConn.Close()
+
+	result, err := merge.Execute(ctx, adminConn, merge.Options{
+		BranchName: "mergebranch",
+		BranchDB:   "pgbr_mergebranch",
+		MainDB:     sourceDB,
+		DryRun:     true,
+		NoData:     true,
+	})
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if len(result.DataOps) != 0 {
+		t.Errorf("expected no data ops with --no-data, got %d: %+v", len(result.DataOps), result.DataOps)
 	}
 }
 

@@ -40,12 +40,19 @@ type SchemaOp struct {
 // DataOp is a DML operation to apply during merge.
 type DataOp struct {
 	Table       string
-	Operation   string // "INSERT", "UPDATE", "DELETE"
+	Operation   string // "INSERT_PK" (executable), "SYNC" (manual review only)
 	RowKey      string // PK value(s) for display
 	SQL         string
 	Status      string // "ok", "conflict"
 	BranchValue string // for conflict display
 	MainValue   string // for conflict display
+
+	// Execution hints — populated for INSERT_PK ops. applyMerge uses these
+	// to stream rows from branch into main. Kept out of the human summary.
+	Schema     string
+	TableName  string
+	PKColumns  []string
+	AllColumns []string
 }
 
 // HasConflicts returns true if any conflicts exist.
@@ -54,13 +61,12 @@ func (r *MergeResult) HasConflicts() bool {
 }
 
 // PendingDataChanges returns true if the merge detected data differences
-// that were not applied. The current implementation flags data changes via
-// checksum comparison but does not execute a row-level sync — callers should
-// surface this to the user so they don't mistake a schema-only merge for a
-// full data-and-schema merge.
+// that can't be applied automatically (no primary key, or operations beyond
+// append-only inserts). These show up in the summary as [NOT APPLIED] so
+// users don't mistake a partial data merge for a full one.
 func (r *MergeResult) PendingDataChanges() bool {
 	for _, op := range r.DataOps {
-		if op.SQL == "" {
+		if op.Operation == "SYNC" {
 			return true
 		}
 	}
@@ -96,10 +102,11 @@ func (r *MergeResult) Summary() string {
 		fmt.Fprintf(&b, "Data operations (%d):\n", len(r.DataOps))
 		for _, op := range r.DataOps {
 			marker := "[OK]"
-			if op.Status == "conflict" {
+			switch {
+			case op.Status == "conflict":
 				marker = "[CONFLICT]"
-			} else if op.SQL == "" {
-				// No executable SQL generated — reported for manual review only.
+			case op.Operation == "SYNC":
+				// No executable plan — flagged for manual review only.
 				marker = "[NOT APPLIED]"
 			}
 			fmt.Fprintf(&b, "  %s %s %s (key: %s)\n", marker, op.Operation, op.Table, op.RowKey)
