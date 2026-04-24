@@ -53,6 +53,20 @@ func (r *MergeResult) HasConflicts() bool {
 	return len(r.Conflicts) > 0
 }
 
+// PendingDataChanges returns true if the merge detected data differences
+// that were not applied. The current implementation flags data changes via
+// checksum comparison but does not execute a row-level sync — callers should
+// surface this to the user so they don't mistake a schema-only merge for a
+// full data-and-schema merge.
+func (r *MergeResult) PendingDataChanges() bool {
+	for _, op := range r.DataOps {
+		if op.SQL == "" {
+			return true
+		}
+	}
+	return false
+}
+
 // Summary returns a human-readable merge summary.
 func (r *MergeResult) Summary() string {
 	var b strings.Builder
@@ -84,6 +98,9 @@ func (r *MergeResult) Summary() string {
 			marker := "[OK]"
 			if op.Status == "conflict" {
 				marker = "[CONFLICT]"
+			} else if op.SQL == "" {
+				// No executable SQL generated — reported for manual review only.
+				marker = "[NOT APPLIED]"
 			}
 			fmt.Fprintf(&b, "  %s %s %s (key: %s)\n", marker, op.Operation, op.Table, op.RowKey)
 		}
@@ -107,7 +124,11 @@ func (r *MergeResult) Summary() string {
 	}
 
 	if r.Applied {
-		fmt.Fprintln(&b, "Merge applied successfully.")
+		if r.PendingDataChanges() {
+			fmt.Fprintln(&b, "Schema merge applied. Data changes were DETECTED but NOT APPLIED — review the data ops above and sync manually.")
+		} else {
+			fmt.Fprintln(&b, "Merge applied successfully.")
+		}
 	}
 
 	return b.String()
