@@ -163,4 +163,4 @@ Tests run against a local PostgreSQL instance. Set `PG_BRANCH_TEST_URL` to overr
 
 ## License
 
-MIT
+Apache License 2.0 — see [LICENSE](LICENSE).
