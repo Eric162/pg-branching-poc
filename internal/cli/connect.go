@@ -14,7 +14,7 @@ var connectCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		u := mustResolveURL()
 
-		state, err := loadStateFromCwd()
+		state, err := loadActiveState()
 		if err != nil {
 			return fmt.Errorf("load state: %w", err)
 		}

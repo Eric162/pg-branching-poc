@@ -7,7 +7,10 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var pgURL string
+var (
+	pgURL         string
+	stateFileFlag string
+)
 
 var rootCmd = &cobra.Command{
 	Use:   "pg-branch",
@@ -17,7 +20,9 @@ var rootCmd = &cobra.Command{
 
 func init() {
 	rootCmd.PersistentFlags().StringVar(&pgURL, "pg-url", "",
-		"PostgreSQL connection URL (default: from .pg-branch.state.json or PG_BRANCH_URL env)")
+		"PostgreSQL connection URL (default: from active state file or PG_BRANCH_URL env)")
+	rootCmd.PersistentFlags().StringVar(&stateFileFlag, "state-file", "",
+		"Path to state file to read/write (default: PG_BRANCH_STATE_FILE env, then CWD .pg-branch.state.json, then central $XDG_STATE_HOME/pg-branch/<current>.json)")
 
 	rootCmd.AddCommand(initCmd)
 	rootCmd.AddCommand(createCmd)
@@ -26,6 +31,7 @@ func init() {
 	rootCmd.AddCommand(switchCmd)
 	rootCmd.AddCommand(connectCmd)
 	rootCmd.AddCommand(statusCmd)
+	rootCmd.AddCommand(useCmd)
 }
 
 func Execute() error {
@@ -37,9 +43,14 @@ func Execute() error {
 // Resolution order:
 //  1. --pg-url flag
 //  2. PG_BRANCH_URL env var
-//  3. ServerURL saved in the state file at init time, joined with MainDB
-//  4. Legacy fallback for state files written before ServerURL was stored:
-//     synthesize postgresql://localhost:5432/<MainDB>
+//  3. ServerURL saved in the active state file at init time, joined
+//     with MainDB. The active state file is itself resolved via
+//     resolveStateFile (--state-file → env → CWD legacy → central
+//     pointer), so this works whether the user is in a project
+//     directory with a per-repo file or on a fresh shell with the
+//     XDG-central layout.
+//  4. Legacy fallback for state files written before ServerURL was
+//     stored: synthesize postgresql://localhost:5432/<MainDB>.
 func resolveURL() string {
 	if pgURL != "" {
 		return pgURL
@@ -47,7 +58,7 @@ func resolveURL() string {
 	if u := os.Getenv("PG_BRANCH_URL"); u != "" {
 		return u
 	}
-	state, err := loadStateFromCwd()
+	state, err := loadActiveState()
 	if err != nil || state.MainDB == "" {
 		return ""
 	}

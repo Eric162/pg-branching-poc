@@ -45,7 +45,7 @@ var mergeCmd = &cobra.Command{
 		branchName := args[0]
 		u := mustResolveURL()
 
-		state, err := loadStateFromCwd()
+		state, err := loadActiveState()
 		if err != nil {
 			return fmt.Errorf("load state: %w", err)
 		}

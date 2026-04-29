@@ -17,11 +17,15 @@ func AdminDBNameForTest() string { return adminDBName() }
 // a flag, otherwise that flag will leak across tests.
 func ResetFlagsForTest() {
 	pgURL = ""
+	stateFileFlag = ""
 	createFrom = ""
 	mergeInto = ""
 	mergeApply = false
 	mergeResolve = ""
 	mergeNoLock = false
 	mergeNoData = false
+	mergeMetaTables = ""
+	mergeMetaTablesExtra = ""
+	initCwd = false
 	logVerbose = false
 }

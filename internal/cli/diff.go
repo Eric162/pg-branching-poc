@@ -17,7 +17,7 @@ var diffCmd = &cobra.Command{
 		ctx := cmd.Context()
 		u := mustResolveURL()
 
-		state, err := loadStateFromCwd()
+		state, err := loadActiveState()
 		if err != nil {
 			return fmt.Errorf("load state: %w", err)
 		}

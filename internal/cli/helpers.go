@@ -4,17 +4,70 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/pg-branch/pg-branch/internal/config"
 	"github.com/pg-branch/pg-branch/internal/pg"
 )
 
+// loadStateFromCwd is preserved for tests and a few callers that
+// explicitly want the legacy CWD location. Most code should call
+// loadActiveState instead so it picks up --state-file / env / central.
 func loadStateFromCwd() (*config.State, error) {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return nil, err
 	}
 	return config.LoadState(cwd)
+}
+
+// resolveStateFile returns the path of the state file the CLI should
+// read for the current invocation. Resolution order:
+//  1. --state-file flag
+//  2. PG_BRANCH_STATE_FILE env var
+//  3. CWD .pg-branch.state.json (legacy per-project state, kept for
+//     backward compatibility — pre-existing setups Just Work)
+//  4. Central pointer: $XDG_STATE_HOME/pg-branch/current → that DB's
+//     state file under the same directory
+//
+// Returns ("", nil) when no source resolves — callers (init, use)
+// supply their own fallback so they can write a fresh state file.
+func resolveStateFile() (string, error) {
+	if stateFileFlag != "" {
+		return stateFileFlag, nil
+	}
+	if env := os.Getenv("PG_BRANCH_STATE_FILE"); env != "" {
+		return env, nil
+	}
+	cwd, err := os.Getwd()
+	if err == nil {
+		legacy := filepath.Join(cwd, config.StateFileName)
+		if _, statErr := os.Stat(legacy); statErr == nil {
+			return legacy, nil
+		}
+	}
+	current, err := config.ReadCurrent()
+	if err != nil {
+		return "", err
+	}
+	if current == "" {
+		return "", nil
+	}
+	return config.CentralStateFile(current)
+}
+
+// loadActiveState resolves the active state file and loads it. Returns
+// a friendly error when no source resolves so users know exactly how to
+// recover (run init, set env, pass --state-file).
+func loadActiveState() (*config.State, error) {
+	path, err := resolveStateFile()
+	if err != nil {
+		return nil, err
+	}
+	if path == "" {
+		return nil, fmt.Errorf("no pg-branch state found. Run 'pg-branch init --pg-url=...' to create one, or pass --state-file / set PG_BRANCH_STATE_FILE")
+	}
+	return config.LoadStateFromFile(path)
 }
 
 // adminDBName returns the maintenance database to connect to for

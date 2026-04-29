@@ -206,19 +206,43 @@ func TestMergeBranchNotFound(t *testing.T) {
 	}
 }
 
-func TestNoURLResolvable(t *testing.T) {
+// TestSwitchDoesNotRequireURL: switch only consults state.CurrentBranch,
+// not the Postgres connection URL, so it works without --pg-url or
+// PG_BRANCH_URL as long as a state file exists. The legacy CWD layout
+// is the easiest way to set up state without poking at XDG paths in a
+// test, and it exercises the legacy-resolution branch of resolveStateFile.
+func TestSwitchDoesNotRequireURL(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
-	// No state file written, no --pg-url, no PG_BRANCH_URL env set.
 	os.Unsetenv("PG_BRANCH_URL")
+	writeState(t, dir, &config.State{
+		MainDB:   "myapp_dev",
+		Branches: map[string]config.BranchState{},
+	})
 
-	// list calls mustResolveURL which exits with os.Exit(1) on failure; we
-	// can't observe that from tests without intercepting. Use switch
-	// instead — it only consults state.CurrentBranch and doesn't demand a
-	// URL, so we exercise the state-loading path cleanly.
 	out, err := runCLI(t, "switch", "main")
 	if err != nil {
 		t.Fatalf("switch without URL should still work: %v (out=%s)", err, out)
+	}
+}
+
+// TestNakedCommandWithNoStateErrors: with no state file in CWD, no env
+// override, and no central pointer, commands should fail with a clear
+// "run init" message rather than silently producing an empty state and
+// pretending to succeed (which is what the old loadStateFromCwd did).
+func TestNakedCommandWithNoStateErrors(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	os.Unsetenv("PG_BRANCH_URL")
+	t.Setenv("PG_BRANCH_STATE_FILE", "")
+	t.Setenv("XDG_STATE_HOME", t.TempDir()) // empty, no `current` pointer
+
+	_, err := runCLI(t, "switch", "main")
+	if err == nil {
+		t.Fatal("expected error when no state can be resolved")
+	}
+	if !strings.Contains(err.Error(), "init") {
+		t.Errorf("expected error to mention 'init', got: %v", err)
 	}
 }
 
@@ -267,5 +291,206 @@ func TestStateFileWritten(t *testing.T) {
 	writeState(t, dir, &config.State{MainDB: "app", Branches: map[string]config.BranchState{}})
 	if _, err := os.Stat(filepath.Join(dir, config.StateFileName)); err != nil {
 		t.Fatalf("state file missing: %v", err)
+	}
+}
+
+// isolateXDG points XDG_STATE_HOME at a fresh temp dir for the test's
+// duration. Without this, tests touching central state would scribble
+// in the developer's real ~/.local/state/pg-branch directory.
+func isolateXDG(t *testing.T) string {
+	t.Helper()
+	xdg := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", xdg)
+	return xdg
+}
+
+// TestUseListsKnownContexts: 'pg-branch use' with no arg prints the
+// current pointer (or 'No current context set.') and the list of
+// central state files. This is the discovery path users hit when they
+// land on a new shell and want to see what's available.
+func TestUseListsKnownContexts(t *testing.T) {
+	xdg := isolateXDG(t)
+	t.Chdir(t.TempDir())
+	t.Setenv("PG_BRANCH_STATE_FILE", "")
+	os.Unsetenv("PG_BRANCH_URL")
+
+	// Seed two central state files. Use config helpers directly rather
+	// than the runCLI path, so we don't depend on a live Postgres for
+	// init.
+	for _, name := range []string{"alpha", "beta"} {
+		p := filepath.Join(xdg, "pg-branch", name+".json")
+		if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		s := config.NewStateAtFile(p)
+		s.MainDB = name
+		if err := s.Save(); err != nil {
+			t.Fatalf("save %s: %v", name, err)
+		}
+	}
+
+	out, err := runCLI(t, "use")
+	if err != nil {
+		t.Fatalf("use: %v (out=%s)", err, out)
+	}
+	for _, want := range []string{"No current context set.", "alpha", "beta"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %q in output, got: %s", want, out)
+		}
+	}
+}
+
+// TestUseSwitchesCurrentPointer: 'pg-branch use <name>' updates the
+// central 'current' file, and a subsequent state-loading command reads
+// from that DB's central state file.
+func TestUseSwitchesCurrentPointer(t *testing.T) {
+	xdg := isolateXDG(t)
+	t.Chdir(t.TempDir())
+	t.Setenv("PG_BRANCH_STATE_FILE", "")
+	os.Unsetenv("PG_BRANCH_URL")
+
+	// Seed a central state file with a branch entry; the test will
+	// 'use' it and then assert that 'switch' on that branch resolves
+	// without further configuration.
+	p := filepath.Join(xdg, "pg-branch", "alpha.json")
+	if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	s := config.NewStateAtFile(p)
+	s.MainDB = "alpha"
+	s.AddBranch("feature-a", config.BranchState{
+		DBName:    "pgbr_feature-a",
+		ParentDB:  "alpha",
+		CreatedAt: "2026-04-28T00:00:00Z",
+	})
+	if err := s.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	out, err := runCLI(t, "use", "alpha")
+	if err != nil {
+		t.Fatalf("use alpha: %v (out=%s)", err, out)
+	}
+	if !strings.Contains(out, "alpha") {
+		t.Errorf("expected confirmation mentioning alpha, got: %s", out)
+	}
+
+	// 'switch feature-a' should now find the branch via the central pointer.
+	out, err = runCLI(t, "switch", "feature-a")
+	if err != nil {
+		t.Fatalf("switch feature-a after use: %v (out=%s)", err, out)
+	}
+	if !strings.Contains(out, "feature-a") {
+		t.Errorf("expected switch confirmation, got: %s", out)
+	}
+}
+
+// TestUseRejectsUnknownContext: 'use' won't write the pointer to a DB
+// that has no central state file — that would just defer the failure to
+// the next command with a worse error message.
+func TestUseRejectsUnknownContext(t *testing.T) {
+	isolateXDG(t)
+	t.Chdir(t.TempDir())
+
+	_, err := runCLI(t, "use", "ghost")
+	if err == nil {
+		t.Fatal("expected error for unknown context")
+	}
+	if !strings.Contains(err.Error(), "ghost") {
+		t.Errorf("error should name the missing context, got: %v", err)
+	}
+}
+
+// TestStateFileFlagOverridesCentral: --state-file beats both the CWD
+// legacy file and the central pointer. Useful for one-off operations
+// against an arbitrary state file (a backup, or a colleague's export)
+// without touching the user's normal context.
+func TestStateFileFlagOverridesCentral(t *testing.T) {
+	xdg := isolateXDG(t)
+	t.Chdir(t.TempDir())
+	os.Unsetenv("PG_BRANCH_URL")
+
+	// Central context says "alpha"
+	pAlpha := filepath.Join(xdg, "pg-branch", "alpha.json")
+	if err := os.MkdirAll(filepath.Dir(pAlpha), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	sAlpha := config.NewStateAtFile(pAlpha)
+	sAlpha.MainDB = "alpha"
+	sAlpha.AddBranch("alpha-feat", config.BranchState{DBName: "pgbr_alpha-feat", ParentDB: "alpha"})
+	if err := sAlpha.Save(); err != nil {
+		t.Fatalf("save alpha: %v", err)
+	}
+	if err := config.WriteCurrent("alpha"); err != nil {
+		t.Fatalf("write current: %v", err)
+	}
+
+	// Out-of-band state file mentions a different branch
+	other := filepath.Join(t.TempDir(), "manual-state.json")
+	sOther := config.NewStateAtFile(other)
+	sOther.MainDB = "elsewhere"
+	sOther.AddBranch("manual-branch", config.BranchState{DBName: "pgbr_manual-branch", ParentDB: "elsewhere"})
+	if err := sOther.Save(); err != nil {
+		t.Fatalf("save other: %v", err)
+	}
+
+	out, err := runCLI(t, "switch", "manual-branch", "--state-file", other)
+	if err != nil {
+		t.Fatalf("switch via --state-file: %v (out=%s)", err, out)
+	}
+	if !strings.Contains(out, "manual-branch") {
+		t.Errorf("expected switch to manual-branch, got: %s", out)
+	}
+
+	// And alpha's central state file should be unchanged.
+	reloaded, err := config.LoadStateFromFile(pAlpha)
+	if err != nil {
+		t.Fatalf("reload alpha: %v", err)
+	}
+	if reloaded.CurrentBranch != "" {
+		t.Errorf("alpha state should be untouched; got CurrentBranch=%q", reloaded.CurrentBranch)
+	}
+}
+
+// TestCWDStateBeatsCentralPointer: a project-local .pg-branch.state.json
+// takes precedence over the central pointer. This preserves the legacy
+// per-repo workflow for users who haven't migrated, and lets a project
+// pin a specific context simply by checking in (or never deleting) its
+// state file.
+func TestCWDStateBeatsCentralPointer(t *testing.T) {
+	xdg := isolateXDG(t)
+	dir := t.TempDir()
+	t.Chdir(dir)
+	os.Unsetenv("PG_BRANCH_URL")
+	t.Setenv("PG_BRANCH_STATE_FILE", "")
+
+	// Central says "alpha"
+	pAlpha := filepath.Join(xdg, "pg-branch", "alpha.json")
+	if err := os.MkdirAll(filepath.Dir(pAlpha), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	sAlpha := config.NewStateAtFile(pAlpha)
+	sAlpha.MainDB = "alpha"
+	if err := sAlpha.Save(); err != nil {
+		t.Fatalf("save alpha: %v", err)
+	}
+	if err := config.WriteCurrent("alpha"); err != nil {
+		t.Fatalf("write current: %v", err)
+	}
+
+	// CWD state mentions a different DB and a branch
+	writeState(t, dir, &config.State{
+		MainDB: "project_local",
+		Branches: map[string]config.BranchState{
+			"local-feat": {DBName: "pgbr_local-feat", ParentDB: "project_local"},
+		},
+	})
+
+	out, err := runCLI(t, "switch", "local-feat")
+	if err != nil {
+		t.Fatalf("switch (CWD): %v (out=%s)", err, out)
+	}
+	if !strings.Contains(out, "local-feat") {
+		t.Errorf("CWD state should win; got: %s", out)
 	}
 }

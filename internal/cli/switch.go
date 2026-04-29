@@ -13,7 +13,7 @@ var switchCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		name := args[0]
 
-		state, err := loadStateFromCwd()
+		state, err := loadActiveState()
 		if err != nil {
 			return fmt.Errorf("load state: %w", err)
 		}
