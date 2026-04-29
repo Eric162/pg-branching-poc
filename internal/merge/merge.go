@@ -168,7 +168,7 @@ func Execute(ctx context.Context, adminConn *pg.Conn, opts Options) (*MergeResul
 	}
 
 	// 5. Build schema merge ops
-	buildSchemaMergeOps(result, mainChanges, branchChanges, ddlLog, opts.Resolve, branchConn)
+	buildSchemaMergeOps(result, mainChanges, branchChanges, ddlLog, opts.Resolve, branchConn, branchSchema)
 
 	// 6. Data merge — compare checksums. NoData=true still processes
 	// meta-table rows so migration bookkeeping stays in sync with schema.
@@ -204,7 +204,7 @@ func Execute(ctx context.Context, adminConn *pg.Conn, opts Options) (*MergeResul
 }
 
 // buildSchemaMergeOps compares branch and main schema changes to detect conflicts and build ops.
-func buildSchemaMergeOps(result *MergeResult, mainChanges, branchChanges []diff.SchemaChange, ddlLog []tracker.DDLEntry, resolve ResolveMode, branchConn *pg.Conn) {
+func buildSchemaMergeOps(result *MergeResult, mainChanges, branchChanges []diff.SchemaChange, ddlLog []tracker.DDLEntry, resolve ResolveMode, branchConn *pg.Conn, branchSchema *pg.SchemaSnapshot) {
 	// Index main changes by object name for conflict detection
 	mainChangeMap := make(map[string]diff.SchemaChange)
 	for _, mc := range mainChanges {
@@ -214,6 +214,19 @@ func buildSchemaMergeOps(result *MergeResult, mainChanges, branchChanges []diff.
 	// Track pg_dump SQL for added tables — indexes/constraints are included in the dump
 	pgDumpSQL := make(map[string]string) // table name -> full pg_dump DDL
 
+	// Tables added on the branch — any index/constraint on these is implicit
+	// in the table's own CREATE TABLE, so we never replay it separately.
+	// Without this guard, the DDL-log fallback (used when pg_dump is missing
+	// or version-mismatched) returns the parent CREATE TABLE for the index's
+	// ddl_command_end entry and we'd run CREATE TABLE twice.
+	addedTables := make(map[string]struct{})
+	for _, bc := range branchChanges {
+		if bc.ObjectKind == "table" && bc.Type == diff.Added {
+			addedTables[bc.ObjectName] = struct{}{}
+		}
+	}
+	parentTable := buildParentTableMap(branchSchema)
+
 	// Sort: process tables before indexes/constraints so pg_dump results are available
 	sortChanges(branchChanges)
 
@@ -222,8 +235,18 @@ func buildSchemaMergeOps(result *MergeResult, mainChanges, branchChanges []diff.
 		mc, mainAlsoChanged := mainChangeMap[bc.ObjectName]
 
 		if !mainAlsoChanged {
-			// Skip indexes/constraints already included in a pg_dump for an added table
+			// Skip indexes/constraints attached to a newly-added table — the
+			// parent's CREATE TABLE (or pg_dump output) carries them already.
 			if (bc.ObjectKind == "index" || bc.ObjectKind == "constraint") && bc.Type == diff.Added {
+				if parent, ok := parentTable[bc.ObjectName]; ok {
+					if _, isAdded := addedTables[parent]; isAdded {
+						result.SchemaOps = append(result.SchemaOps, SchemaOp{
+							Description: bc.Detail + " (included in table DDL)",
+							Status:      "skipped",
+						})
+						continue
+					}
+				}
 				if coveredByPgDump(bc.ObjectName, pgDumpSQL) {
 					result.SchemaOps = append(result.SchemaOps, SchemaOp{
 						Description: bc.Detail + " (included in table DDL)",
@@ -340,6 +363,20 @@ func containsObjectRef(command, objectName string) bool {
 		}
 	}
 	return false
+}
+
+// buildParentTableMap maps fully-qualified index/constraint names to their
+// parent table from a schema snapshot, so we can recognize when an index or
+// constraint belongs to a table that's also being added in the same merge.
+func buildParentTableMap(snap *pg.SchemaSnapshot) map[string]string {
+	m := make(map[string]string, len(snap.Indexes)+len(snap.Constraints))
+	for _, idx := range snap.Indexes {
+		m[idx.Schema+"."+idx.Name] = idx.Schema + "." + idx.Table
+	}
+	for _, c := range snap.Constraints {
+		m[c.Schema+"."+c.Name] = c.Schema + "." + c.Table
+	}
+	return m
 }
 
 // coveredByPgDump checks if an index/constraint object name appears in any pg_dump DDL
