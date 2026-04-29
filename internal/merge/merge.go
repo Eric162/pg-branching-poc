@@ -26,6 +26,31 @@ const (
 	ResolveMain   ResolveMode = "main"   // main wins
 )
 
+// DefaultMetaTables names migration-bookkeeping tables that pg-branch always
+// data-merges, even when NoData is true. The risk of NOT propagating these
+// is silent schema/meta drift: schema DDL lands on the target while the rows
+// tracking which migrations have been applied are left behind, causing the
+// migration runner to re-apply migrations whose schema effects are already
+// present and fail on duplicate objects.
+//
+// The default set covers single-table-per-tool conventions:
+//   - sequelize_meta         (Sequelize)
+//   - schema_migrations      (Rails / ActiveRecord, golang-migrate)
+//   - goose_db_version       (goose)
+//   - flyway_schema_history  (Flyway)
+//   - knex_migrations        (Knex)
+//
+// Names without a dot match by table name in any schema. Names with a dot
+// are matched as schema.table. Set Options.MetaTables to replace the list
+// or Options.MetaTablesExtra to add on top.
+var DefaultMetaTables = []string{
+	"sequelize_meta",
+	"schema_migrations",
+	"goose_db_version",
+	"flyway_schema_history",
+	"knex_migrations",
+}
+
 // Options configures a merge operation.
 type Options struct {
 	BranchName string
@@ -38,10 +63,23 @@ type Options struct {
 	// of the same branch/main pair. Use with care — concurrent merges can
 	// interleave DDL and corrupt the merged state.
 	NoLock bool
-	// NoData skips the row-level data merge entirely; only schema ops are
-	// considered. Useful when you want to review data changes manually or
-	// when branch and main are intentionally diverging.
+	// NoData skips the row-level data merge for ordinary tables. Migration-
+	// bookkeeping tables in the resolved meta-table set (see MetaTables /
+	// MetaTablesExtra / DefaultMetaTables) are still data-merged, since
+	// dropping their rows while keeping schema DDL is the bug that prompted
+	// this flag's redesign. Useful when you want to review most data
+	// changes manually but still keep migration state in sync.
 	NoData bool
+	// MetaTables, when non-nil, replaces DefaultMetaTables as the set of
+	// migration-bookkeeping tables that always data-merge regardless of
+	// NoData. Pass an empty (but non-nil) slice to disable meta-table
+	// protection entirely.
+	MetaTables []string
+	// MetaTablesExtra is appended to the resolved meta-table set
+	// (DefaultMetaTables, or MetaTables if that's set). Use when you want
+	// to keep the defaults and add a couple of project-specific
+	// bookkeeping tables.
+	MetaTablesExtra []string
 	// Stderr receives phase-label progress output ("Loading branch-point
 	// snapshot...", etc.). Defaults to os.Stderr when nil; set to
 	// io.Discard to silence or to a bytes.Buffer in tests.
@@ -132,8 +170,10 @@ func Execute(ctx context.Context, adminConn *pg.Conn, opts Options) (*MergeResul
 	// 5. Build schema merge ops
 	buildSchemaMergeOps(result, mainChanges, branchChanges, ddlLog, opts.Resolve, branchConn)
 
-	// 6. Data merge — compare checksums (skippable via --no-data)
-	if !opts.NoData {
+	// 6. Data merge — compare checksums. NoData=true still processes
+	// meta-table rows so migration bookkeeping stays in sync with schema.
+	metaSet := resolvedMetaTables(opts)
+	if !opts.NoData || len(metaSet) > 0 {
 		fmt.Fprintf(stderr, "  Checksumming main...\n")
 		mainChecksums, err := diff.ComputeTableChecksums(ctx, mainConn, opts.Progress)
 		if err != nil {
@@ -144,7 +184,7 @@ func Execute(ctx context.Context, adminConn *pg.Conn, opts Options) (*MergeResul
 		if err != nil {
 			return nil, fmt.Errorf("branch checksums: %w", err)
 		}
-		if err := buildDataMergeOps(ctx, result, mainConn, branchConn, mainChecksums, branchChecksums); err != nil {
+		if err := buildDataMergeOps(ctx, result, mainConn, branchConn, mainChecksums, branchChecksums, metaSet, opts.NoData); err != nil {
 			return nil, fmt.Errorf("build data merge ops: %w", err)
 		}
 	}
@@ -355,7 +395,8 @@ func splitObjectName(name string) []string {
 // behaviour for those cases.
 func buildDataMergeOps(ctx context.Context, result *MergeResult,
 	mainConn, branchConn *pg.Conn,
-	mainChecksums, branchChecksums []diff.TableChecksum) error {
+	mainChecksums, branchChecksums []diff.TableChecksum,
+	metaSet map[string]struct{}, onlyMeta bool) error {
 
 	mainMap := make(map[string]diff.TableChecksum)
 	for _, mc := range mainChecksums {
@@ -363,10 +404,23 @@ func buildDataMergeOps(ctx context.Context, result *MergeResult,
 	}
 
 	for _, bc := range branchChecksums {
+		// In --no-data mode we still process meta tables so migration
+		// bookkeeping stays in sync with schema DDL.
+		if onlyMeta && !isMetaTable(bc.Schema, bc.Table, metaSet) {
+			continue
+		}
+
 		key := bc.Schema + "." + bc.Table
 		mc, mainExists := mainMap[key]
+
 		if !mainExists {
-			// New table only on branch — DDL replay handles both schema and data.
+			// New table only on branch. The schema phase will CREATE TABLE
+			// it on main (via pg_dump --schema-only, which carries no rows),
+			// so we need to follow up with an INSERT_PK plan or the table
+			// arrives empty.
+			if err := emitNewTableDataOp(ctx, result, branchConn, bc); err != nil {
+				return err
+			}
 			continue
 		}
 		if bc.Checksum == mc.Checksum {
@@ -407,6 +461,87 @@ func buildDataMergeOps(ctx context.Context, result *MergeResult,
 		})
 	}
 	return nil
+}
+
+// emitNewTableDataOp builds an INSERT_PK plan for a table that exists only
+// on the branch. The schema phase CREATEs it on main; this op streams its
+// rows in afterwards. Without it, new-on-branch tables ship empty.
+//
+// PK and column metadata come from branchConn since main hasn't seen the
+// table yet at the point we build ops. applyMerge runs schema ops before
+// data ops, so by the time applyPKInsert executes, the table exists on
+// main and fetchPKSet returns an empty set — every branch row gets
+// inserted.
+func emitNewTableDataOp(ctx context.Context, result *MergeResult, branchConn *pg.Conn, bc diff.TableChecksum) error {
+	if bc.RowCount == 0 {
+		return nil
+	}
+	key := bc.Schema + "." + bc.Table
+	rowKey := fmt.Sprintf("%d row(s) (new table)", bc.RowCount)
+
+	pkCols, err := branchConn.PrimaryKeyColumns(ctx, bc.Schema, bc.Table)
+	if err != nil {
+		return fmt.Errorf("primary key for %s: %w", key, err)
+	}
+	if len(pkCols) == 0 {
+		result.DataOps = append(result.DataOps, DataOp{
+			Table:     key,
+			Operation: "SYNC",
+			RowKey:    rowKey + " (no primary key)",
+			Status:    "ok",
+		})
+		return nil
+	}
+	cols, err := branchConn.TableColumnNames(ctx, bc.Schema, bc.Table)
+	if err != nil {
+		return fmt.Errorf("columns for %s: %w", key, err)
+	}
+	result.DataOps = append(result.DataOps, DataOp{
+		Table:      key,
+		Operation:  "INSERT_PK",
+		RowKey:     rowKey,
+		Status:     "ok",
+		Schema:     bc.Schema,
+		TableName:  bc.Table,
+		PKColumns:  pkCols,
+		AllColumns: cols,
+	})
+	return nil
+}
+
+// resolvedMetaTables computes the effective meta-table set keyed for fast
+// membership tests by isMetaTable.
+func resolvedMetaTables(opts Options) map[string]struct{} {
+	base := DefaultMetaTables
+	if opts.MetaTables != nil {
+		base = opts.MetaTables
+	}
+	set := make(map[string]struct{}, len(base)+len(opts.MetaTablesExtra))
+	for _, n := range base {
+		if n != "" {
+			set[n] = struct{}{}
+		}
+	}
+	for _, n := range opts.MetaTablesExtra {
+		if n != "" {
+			set[n] = struct{}{}
+		}
+	}
+	return set
+}
+
+// isMetaTable reports whether schema.table matches an entry in set. Names
+// without a dot in set match by table name in any schema; dotted names
+// match as schema.table. This lets users say "sequelize_meta" without
+// pinning it to public.
+func isMetaTable(schema, table string, set map[string]struct{}) bool {
+	if _, ok := set[table]; ok {
+		return true
+	}
+	if _, ok := set[schema+"."+table]; ok {
+		return true
+	}
+	return false
 }
 
 // applyMerge executes the merge operations within a single transaction.

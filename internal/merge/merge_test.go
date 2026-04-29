@@ -722,6 +722,212 @@ func TestMergeProgressGoesToOptionsStderr(t *testing.T) {
 	}
 }
 
+// TestMergeApply_NewTableWithDataPreservesRows: a table created on the
+// branch with rows in it should arrive on main with those rows after
+// merge. Without an explicit data op for new-on-branch tables, the
+// schema-only DDL replay creates the table empty.
+func TestMergeApply_NewTableWithDataPreservesRows(t *testing.T) {
+	ctx := context.Background()
+	adminConn, sourceDB := setupMergeTest(t, ctx)
+	defer adminConn.Close()
+	defer func() {
+		_ = adminConn.DropDatabase(ctx, "pgbr_mergebranch")
+		_ = adminConn.DropDatabase(ctx, sourceDB)
+	}()
+
+	if err := branch.Create(ctx, adminConn, "mergebranch", sourceDB, "pgbr_mergebranch"); err != nil {
+		t.Fatalf("create branch: %v", err)
+	}
+
+	branchConn, err := adminConn.ConnectToDatabase(ctx, "pgbr_mergebranch")
+	if err != nil {
+		t.Fatalf("connect branch: %v", err)
+	}
+	if err := branchConn.Exec(ctx, `
+		CREATE TABLE posts (id SERIAL PRIMARY KEY, title TEXT NOT NULL);
+		INSERT INTO posts (title) VALUES ('first'), ('second'), ('third');
+	`); err != nil {
+		t.Fatalf("create posts: %v", err)
+	}
+	branchConn.Close()
+
+	if _, err := merge.Execute(ctx, adminConn, merge.Options{
+		BranchName: "mergebranch",
+		BranchDB:   "pgbr_mergebranch",
+		MainDB:     sourceDB,
+		DryRun:     false,
+	}); err != nil {
+		t.Fatalf("merge apply: %v", err)
+	}
+
+	srcConn, err := adminConn.ConnectToDatabase(ctx, sourceDB)
+	if err != nil {
+		t.Fatalf("connect source: %v", err)
+	}
+	defer srcConn.Close()
+
+	var count int
+	if err := srcConn.QueryRow(ctx, "SELECT count(*) FROM posts").Scan(&count); err != nil {
+		t.Fatalf("count posts on main: %v", err)
+	}
+	if count != 3 {
+		t.Errorf("expected 3 rows in posts on main after merge, got %d", count)
+	}
+}
+
+// TestMergeNoData_StillMergesMetaTables: when --no-data is set, ordinary
+// tables are skipped but migration-bookkeeping tables in DefaultMetaTables
+// (here, sequelize_meta) still data-merge. Without this, schema DDL on a
+// branch lands on main but the rows tracking which migrations applied are
+// left behind.
+func TestMergeNoData_StillMergesMetaTables(t *testing.T) {
+	ctx := context.Background()
+	adminConn, sourceDB := setupMergeTest(t, ctx)
+	defer adminConn.Close()
+	defer func() {
+		_ = adminConn.DropDatabase(ctx, "pgbr_mergebranch")
+		_ = adminConn.DropDatabase(ctx, sourceDB)
+	}()
+
+	srcConn, err := adminConn.ConnectToDatabase(ctx, sourceDB)
+	if err != nil {
+		t.Fatalf("connect source: %v", err)
+	}
+	if err := srcConn.Exec(ctx, `
+		CREATE TABLE sequelize_meta (name TEXT PRIMARY KEY);
+		INSERT INTO sequelize_meta (name) VALUES ('001-init.ts');
+	`); err != nil {
+		t.Fatalf("create sequelize_meta: %v", err)
+	}
+	srcConn.Close()
+
+	if err := branch.Create(ctx, adminConn, "mergebranch", sourceDB, "pgbr_mergebranch"); err != nil {
+		t.Fatalf("create branch: %v", err)
+	}
+
+	// On the branch: stamp two new migrations AND insert a user row. The
+	// user row should be skipped (--no-data), the meta rows should land.
+	branchConn, err := adminConn.ConnectToDatabase(ctx, "pgbr_mergebranch")
+	if err != nil {
+		t.Fatalf("connect branch: %v", err)
+	}
+	if err := branchConn.Exec(ctx, `
+		INSERT INTO sequelize_meta (name) VALUES ('002-add-posts.ts'), ('003-add-tags.ts');
+		INSERT INTO users (name, email) VALUES ('Charlie', 'c@x');
+	`); err != nil {
+		t.Fatalf("populate branch: %v", err)
+	}
+	branchConn.Close()
+
+	if _, err := merge.Execute(ctx, adminConn, merge.Options{
+		BranchName: "mergebranch",
+		BranchDB:   "pgbr_mergebranch",
+		MainDB:     sourceDB,
+		DryRun:     false,
+		NoData:     true,
+	}); err != nil {
+		t.Fatalf("merge apply: %v", err)
+	}
+
+	srcConn2, err := adminConn.ConnectToDatabase(ctx, sourceDB)
+	if err != nil {
+		t.Fatalf("connect source: %v", err)
+	}
+	defer srcConn2.Close()
+
+	var metaCount int
+	if err := srcConn2.QueryRow(ctx, "SELECT count(*) FROM sequelize_meta").Scan(&metaCount); err != nil {
+		t.Fatalf("count meta: %v", err)
+	}
+	if metaCount != 3 {
+		t.Errorf("expected 3 sequelize_meta rows on main after merge (1 original + 2 from branch), got %d", metaCount)
+	}
+
+	var userCount int
+	if err := srcConn2.QueryRow(ctx, "SELECT count(*) FROM users").Scan(&userCount); err != nil {
+		t.Fatalf("count users: %v", err)
+	}
+	if userCount != 2 {
+		t.Errorf("expected --no-data to leave users at 2 rows, got %d", userCount)
+	}
+}
+
+// TestMergeMetaTables_CustomListReplacesDefaults: passing MetaTables
+// replaces the default set entirely, so sequelize_meta is no longer
+// protected and the user-named table is.
+func TestMergeMetaTables_CustomListReplacesDefaults(t *testing.T) {
+	ctx := context.Background()
+	adminConn, sourceDB := setupMergeTest(t, ctx)
+	defer adminConn.Close()
+	defer func() {
+		_ = adminConn.DropDatabase(ctx, "pgbr_mergebranch")
+		_ = adminConn.DropDatabase(ctx, sourceDB)
+	}()
+
+	srcConn, err := adminConn.ConnectToDatabase(ctx, sourceDB)
+	if err != nil {
+		t.Fatalf("connect source: %v", err)
+	}
+	if err := srcConn.Exec(ctx, `
+		CREATE TABLE sequelize_meta (name TEXT PRIMARY KEY);
+		CREATE TABLE my_app_versions (id INT PRIMARY KEY, label TEXT);
+	`); err != nil {
+		t.Fatalf("create meta tables: %v", err)
+	}
+	srcConn.Close()
+
+	if err := branch.Create(ctx, adminConn, "mergebranch", sourceDB, "pgbr_mergebranch"); err != nil {
+		t.Fatalf("create branch: %v", err)
+	}
+
+	branchConn, err := adminConn.ConnectToDatabase(ctx, "pgbr_mergebranch")
+	if err != nil {
+		t.Fatalf("connect branch: %v", err)
+	}
+	if err := branchConn.Exec(ctx, `
+		INSERT INTO sequelize_meta (name) VALUES ('a.ts'), ('b.ts');
+		INSERT INTO my_app_versions (id, label) VALUES (1, 'v1'), (2, 'v2');
+	`); err != nil {
+		t.Fatalf("populate branch: %v", err)
+	}
+	branchConn.Close()
+
+	// Custom list — only my_app_versions is protected. sequelize_meta
+	// is now an ordinary table, and --no-data means it gets skipped.
+	if _, err := merge.Execute(ctx, adminConn, merge.Options{
+		BranchName: "mergebranch",
+		BranchDB:   "pgbr_mergebranch",
+		MainDB:     sourceDB,
+		DryRun:     false,
+		NoData:     true,
+		MetaTables: []string{"my_app_versions"},
+	}); err != nil {
+		t.Fatalf("merge apply: %v", err)
+	}
+
+	srcConn2, err := adminConn.ConnectToDatabase(ctx, sourceDB)
+	if err != nil {
+		t.Fatalf("connect source: %v", err)
+	}
+	defer srcConn2.Close()
+
+	var seqCount int
+	if err := srcConn2.QueryRow(ctx, "SELECT count(*) FROM sequelize_meta").Scan(&seqCount); err != nil {
+		t.Fatalf("count sequelize_meta: %v", err)
+	}
+	if seqCount != 0 {
+		t.Errorf("custom MetaTables should drop sequelize_meta from protection; expected 0 rows on main, got %d", seqCount)
+	}
+
+	var verCount int
+	if err := srcConn2.QueryRow(ctx, "SELECT count(*) FROM my_app_versions").Scan(&verCount); err != nil {
+		t.Fatalf("count my_app_versions: %v", err)
+	}
+	if verCount != 2 {
+		t.Errorf("custom MetaTables should protect my_app_versions; expected 2 rows on main, got %d", verCount)
+	}
+}
+
 func TestMergeResolveModeBranch(t *testing.T) {
 	ctx := context.Background()
 	adminConn, sourceDB := setupMergeTest(t, ctx)

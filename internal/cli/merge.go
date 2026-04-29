@@ -3,18 +3,38 @@ package cli
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/pg-branch/pg-branch/internal/merge"
 	"github.com/spf13/cobra"
 )
 
 var (
-	mergeInto    string
-	mergeApply   bool
-	mergeResolve string
-	mergeNoLock  bool
-	mergeNoData  bool
+	mergeInto            string
+	mergeApply           bool
+	mergeResolve         string
+	mergeNoLock          bool
+	mergeNoData          bool
+	mergeMetaTables      string
+	mergeMetaTablesExtra string
 )
+
+// parseCommaList splits a comma-separated string into trimmed, non-empty
+// entries. Returns nil for the empty string (so cobra "not passed" passes
+// through as Options.MetaTables=nil → use defaults).
+func parseCommaList(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
 
 var mergeCmd = &cobra.Command{
 	Use:   "merge <branch>",
@@ -62,15 +82,17 @@ var mergeCmd = &cobra.Command{
 		defer adminConn.Close()
 
 		opts := merge.Options{
-			BranchName: branchName,
-			BranchDB:   bs.DBName,
-			MainDB:     targetDB,
-			DryRun:     !mergeApply,
-			Resolve:    resolveMode,
-			Progress:   stderrProgress("Checksumming"),
-			NoLock:     mergeNoLock,
-			NoData:     mergeNoData,
-			Stderr:     os.Stderr,
+			BranchName:      branchName,
+			BranchDB:        bs.DBName,
+			MainDB:          targetDB,
+			DryRun:          !mergeApply,
+			Resolve:         resolveMode,
+			Progress:        stderrProgress("Checksumming"),
+			NoLock:          mergeNoLock,
+			NoData:          mergeNoData,
+			MetaTables:      parseCommaList(mergeMetaTables),
+			MetaTablesExtra: parseCommaList(mergeMetaTablesExtra),
+			Stderr:          os.Stderr,
 		}
 
 		result, err := merge.Execute(ctx, adminConn, opts)
@@ -91,6 +113,8 @@ func init() {
 	mergeCmd.Flags().BoolVar(&mergeApply, "apply", false, "Apply the merge (default: dry-run)")
 	mergeCmd.Flags().StringVar(&mergeResolve, "resolve", "", "Conflict resolution: 'branch' or 'main'")
 	mergeCmd.Flags().BoolVar(&mergeNoLock, "no-lock", false, "Skip the advisory lock that serialises concurrent merges")
-	mergeCmd.Flags().BoolVar(&mergeNoData, "no-data", false, "Skip the row-level data merge (schema changes only)")
+	mergeCmd.Flags().BoolVar(&mergeNoData, "no-data", false, "Skip the row-level data merge for ordinary tables. Migration-bookkeeping tables (see --meta-tables) are still merged.")
+	mergeCmd.Flags().StringVar(&mergeMetaTables, "meta-tables", "", "Comma-separated bookkeeping tables that always data-merge regardless of --no-data. Replaces the built-in defaults (sequelize_meta, schema_migrations, goose_db_version, flyway_schema_history, knex_migrations). Names without a dot match in any schema; use schema.table to pin.")
+	mergeCmd.Flags().StringVar(&mergeMetaTablesExtra, "meta-tables-extra", "", "Comma-separated additional bookkeeping tables to data-merge, on top of the defaults or --meta-tables.")
 	rootCmd.AddCommand(mergeCmd)
 }
